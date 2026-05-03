@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenClaw Memory · 说明 / About</title>
+  <link rel="stylesheet" href="/dashboard.css" />
+  <link rel="stylesheet" href="/docs.css" />
+</head>
+<body class="docs-page">
+  <header>
+    <div class="title">
+      <span class="logo">🦞</span>
+      <h1>OpenClaw Memory</h1>
+      <span class="subtle">memory-postgres · 系统说明 / About</span>
+    </div>
+    <div class="docs-actions">
+      <div class="lang-toggle pill">
+        <button data-lang="zh" class="active">中文</button>
+        <button data-lang="en">English</button>
+      </div>
+      <a class="pill back" href="/">← Dashboard</a>
+    </div>
+  </header>
+
+  <main class="docs">
+    <!-- =================================================================== -->
+    <!-- ZH ============================================================== -->
+    <!-- =================================================================== -->
+    <article class="lang lang-zh">
+
+      <section class="hero">
+        <h1>类人记忆系统</h1>
+        <p class="lead">
+          OpenClaw memory-postgres 是一套受人脑启发的长期记忆引擎。它把<strong>语义内容</strong>和<strong>结构化事实</strong>分别索引在
+          Postgres + pgvector 里，用 4 层热度（T0–T3）让常用记忆几乎瞬发，用"新华字典"式多键索引保证从任何角度提问都能命中。
+        </p>
+        <div class="stats">
+          <div><strong>4096</strong><small>qwen3 维度</small></div>
+          <div><strong>4 层</strong><small>T0/T1/T2/T3</small></div>
+          <div><strong>7 路</strong><small>并行召回</small></div>
+          <div><strong>~5%</strong><small>vs 旧 token 成本</small></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>① 哲学：为什么要分层</h2>
+        <p>
+          人脑回忆"今天和谁吃了什么"是瞬发的——因为答案早在工作记忆里。OpenClaw memory-postgres 完全照搬这个原理：
+        </p>
+        <ul>
+          <li><strong>T0 工作记忆</strong>（in-memory，&lt;0.1ms）—— 当前会话最热的 ~50 条 chunks，零成本命中</li>
+          <li><strong>T1 热缓存</strong>（PG UNLOGGED 表，~1ms）—— 用户级最近活跃集，跨会话复用</li>
+          <li><strong>T2 主存储</strong>（PG + HNSW + GIN + trgm，5–50ms）—— 全量长期记忆</li>
+          <li><strong>T3 冷归档</strong>（cold.gists，压缩摘要 + 可下钻原文）—— 历史档案</li>
+        </ul>
+        <p>召回先撞 T0，命中即返；不行才往 T1/T2/T3 兜，并把命中物 promote 回上层热缓存。<strong>大多数提问根本不"查"</strong>—— 答案已经在最热的层里。</p>
+      </section>
+
+      <section>
+        <h2>② 写入：6 阶段 Ingest 管道</h2>
+        <p>每条进入系统的内容（用户消息、agent turn、git commit、手工写入）都走完整管道：</p>
+        <ol class="stages">
+          <li><strong>Stage 1 — Trash filter</strong>（确定性，0 token）<span>正则 / 长度 / 句尾词去掉 70-80% 的"好的、收到、Sure!"等口水句</span></li>
+          <li><strong>Stage 0 — Source 信号派生</strong>（确定性，0 token）<span>从工具调用、anchors（cwd/branch/PR/file）、time bucket 直接产生索引信号</span></li>
+          <li><strong>Stage 2 — Sidecar JSON 解析</strong>（0 token）<span>解析 agent turn 末尾的 <code>&lt;mem&gt;{entities,events,prefs,metrics}&lt;/mem&gt;</code></span></li>
+          <li><strong>Stage 3 — Cache 查找</strong>（0 token）<span>同 hash embedding / entity alias 都从 cache.* 取</span></li>
+          <li><strong>Stage 4 — LLM 残差</strong>（仅极少 ~5%）<span>前 4 阶段未覆盖的复杂语义内容才请 LLM</span></li>
+          <li><strong>Stage 5 — 多键索引</strong>（确定性）<span>建立 concept_tag / entity_ref / time_bucket / metric_name / preference_key / event_type / anchor_*</span></li>
+          <li><strong>Stage 6 — Reconcile + 写入</strong>（事务）<span>实体 dedup、preference supersede 链、event 时间桶去重，全部带 provenance 链回原 chunk</span></li>
+        </ol>
+        <div class="note">
+          典型一句话"今天和 @shadow 在 openclaw/openclaw 改了 PR #1234，午饭吃了 1800 卡"会一次性产生：1 个 chunk + ~12 条多键索引 + 4 条结构化行（事件/指标/关系），几乎无 LLM 成本。
+        </div>
+      </section>
+
+      <section>
+        <h2>③ 索引：新华字典式多键</h2>
+        <p>新华字典里一个字可以按拼音、部首、笔画、四角号码查到，不论你怎么入手都能找到。我们对应：</p>
+        <table class="map-table">
+          <thead><tr><th>字典查法</th><th>memory 索引</th><th>实现</th></tr></thead>
+          <tbody>
+            <tr><td>拼音</td><td>语义向量</td><td>HNSW + qwen3-4096</td></tr>
+            <tr><td>笔画</td><td>关键词全文</td><td>tsvector + GIN</td></tr>
+            <tr><td>同音字</td><td>模糊拼写</td><td>pg_trgm + GIST</td></tr>
+            <tr><td>部首</td><td>概念 tag</td><td><code>chunk_indexes(kind=concept_tag)</code></td></tr>
+            <tr><td>偏旁</td><td>实体引用</td><td><code>chunk_indexes(kind=entity_ref)</code></td></tr>
+            <tr><td>四角号码</td><td>时间桶</td><td><code>chunk_indexes(kind=time_bucket)</code></td></tr>
+            <tr><td>—（人脑特有）</td><td>环境锚点</td><td><code>kind=anchor_cwd|branch|pr|file|session</code></td></tr>
+          </tbody>
+        </table>
+        <p>每条 chunk 在 ingest 时<strong>强制</strong>建立全部相关索引。无论你问"昨天的 PR"、"和 Shadow 干的活"、"calorie 摄入"还是"那个文件改了啥"，都能命中。</p>
+      </section>
+
+      <section>
+        <h2>④ 召回：并行 7 路 + MMR 重排</h2>
+        <p>每次 query 不让 classifier 提前砍 route——所有索引并行查，让结果质量自己说话：</p>
+        <div class="route-grid">
+          <div class="route"><strong>semantic</strong><span>HNSW cosine on qwen3 4096-d 向量</span></div>
+          <div class="route"><strong>fulltext</strong><span>tsvector @@ tsquery，bm25 排序</span></div>
+          <div class="route"><strong>trgm</strong><span>pg_trgm 模糊匹配（错别字、缩写）</span></div>
+          <div class="route"><strong>concept_tag</strong><span>主题标签精确 / ANY 匹配</span></div>
+          <div class="route"><strong>entity_ref</strong><span>实体 id 精确匹配</span></div>
+          <div class="route"><strong>time_bucket</strong><span>时间窗口 ISO 日期</span></div>
+          <div class="route"><strong>anchor</strong><span>cwd/branch/pr/file/session 强签</span></div>
+        </div>
+        <p>合并阶段按归一化分数 + 路由权重融合，<strong>MMR 重排</strong>去冗余。锚点命中通常 ~10ms 0 token；纯语义召回 ~250ms + 1 次 qwen3 RTT；缓存命中 ~2ms。</p>
+      </section>
+
+      <section>
+        <h2>⑤ 评分：每次操作 0–100 分</h2>
+        <p>每条 ingest / recall 都计算复合分写入 audit 表，dashboard 上能看趋势：</p>
+        <pre class="formula">
+ingest_score = 100 × (
+    0.30 × token_efficiency      // LLM 用量越少越好
+  + 0.20 × latency_efficiency    // 越快越好
+  + 0.30 × quality_signal        // accept/extractor confidence
+  + 0.20 × path_efficiency       // deterministic &gt; cache &gt; sidecar &gt; llm
+)
+
+recall_score = 100 × (
+    0.25 × token_efficiency
+  + 0.25 × latency_efficiency
+  + 0.25 × tier_efficiency       // T0=1.0 &gt; T1=0.9 &gt; T2_anchor=0.75 &gt; T2=0.55 &gt; T3=0.2
+  + 0.25 × relevance             // 命中是否被 agent 真用，1h 内异步回填
+)</pre>
+        <p>权重可在 <code>scoring</code> 配置里调整。Self-tuning（见⑦）会基于这些分趋势自动提建议。</p>
+      </section>
+
+      <section>
+        <h2>⑥ 后台 Workers</h2>
+        <ul>
+          <li><strong>Context Primer</strong>—— 会话开启时按 cwd / branch 预热 T0/T1</li>
+          <li><strong>Spreading Activator</strong>—— 召回命中后异步 promote 邻居（共享 entity / concept_tag 的 chunks）</li>
+          <li><strong>Compactor</strong>—— dream phase 把 90 天未召回的 chunks 按 concept_tag 聚类、生成 cold.gists 压缩摘要、原文转 ephemeral 但保留 source_chunk_ids 供下钻</li>
+          <li><strong>Recall Feedback</strong>—— recall_count++、warmth_score++、命中的 chunk_indexes.weight 微调（Hebbian-style）</li>
+          <li><strong>Tuning Analyzer</strong>—— 见⑦</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>⑦ 自调节循环 Self-Tuning</h2>
+        <p>系统会根据 audit 数据自动分析、提议改进：</p>
+        <table class="map-table">
+          <thead><tr><th>节奏</th><th>检查项</th><th>风险级别</th></tr></thead>
+          <tbody>
+            <tr><td>Daily</td><td>cache 命中率太低 → 缩 TTL；太高 → 加 TTL</td><td>safe_auto（自动应用）</td></tr>
+            <tr><td>Daily</td><td>boilerplate 命中率低 → 提议加 trash regex</td><td>review_required</td></tr>
+            <tr><td>Daily</td><td>ingest score 比上周跌 &gt;20% → 报警</td><td>review_required</td></tr>
+            <tr><td>Weekly</td><td>tier 容量、salience 阈值校准</td><td>review_required</td></tr>
+            <tr><td>Monthly</td><td>schema 演化、embedding 升级建议</td><td>high_risk（必须人审）</td></tr>
+          </tbody>
+        </table>
+        <p>所有自动应用都有 <strong>24h guard</strong>：跟踪关键 score，如果跌幅 &gt;20% 自动 revert 回旧值。</p>
+      </section>
+
+      <section>
+        <h2>⑧ 数据库结构</h2>
+        <p>单实例 Postgres 16 + pgvector + pg_trgm + btree_gin，五个 schema：</p>
+        <ul>
+          <li><code>semantic.*</code> — chunks（embedding + 全文 + 多键索引）</li>
+          <li><code>structured.*</code> — entities / relations / events / preferences / metrics + provenance</li>
+          <li><code>cache.*</code> — UNLOGGED 表：hot_chunks / embeddings / intent / recall / entity_alias</li>
+          <li><code>cold.*</code> — gists（压缩归档）</li>
+          <li><code>audit.*</code> — dream_runs / ingest_decisions / recall_decisions / tuning_proposals</li>
+        </ul>
+        <p>所有结构化行都有 <code>structured.provenance</code> 链回 source chunk。问"你为什么觉得我喜欢 X" 时可以直接 SQL JOIN 出原话。</p>
+      </section>
+
+      <section>
+        <h2>⑨ Embedding endpoint</h2>
+        <p>
+          所有 embedding 通过你配置的 embedding endpoint（默认通过本地 Tailscale 网络的 OpenAI-compat proxy，地址通过 <code>config.embedding.baseUrl</code> 设置） 调
+          <strong>qwen3-embedding 4096-d</strong>。
+          OpenAI 兼容 <code>/v1/embeddings</code> 协议，按 endpoint 配置可选 Bearer token。
+          典型一次 embed RTT ~250ms；缓存命中 0 调用。
+        </p>
+      </section>
+
+      <section>
+        <h2>⑩ 暴露的 Agent 工具</h2>
+        <ul>
+          <li><strong><code>memory_search(query, cwd?, branch?, pr?, timeBucket?, limit?)</code></strong> —— 长期记忆查询。带 anchor 走 0 成本路径</li>
+          <li><strong><code>memory_store(text, importance?, pinned?, cwd?, branch?, pr?, file?)</code></strong> —— 写入事实 / 偏好 / 决定。Discord bot 上可以让用户直接说"记住 X"</li>
+        </ul>
+      </section>
+
+      <section class="footer-note">
+        <p>项目分支：<code>memory-postgres-redesign</code> · 数据库：<code>127.0.0.1:55432/openclaw_memory</code> · 仪表板：本页 · 完整 plan：<code>~/.claude/plans/openclaw-openclaw-iridescent-pudding.md</code></p>
+      </section>
+    </article>
+
+    <!-- =================================================================== -->
+    <!-- EN ============================================================== -->
+    <!-- =================================================================== -->
+    <article class="lang lang-en" hidden>
+
+      <section class="hero">
+        <h1>Human-Inspired Memory</h1>
+        <p class="lead">
+          OpenClaw memory-postgres is a long-term memory engine modeled on how human recall works.
+          It splits <strong>semantic content</strong> and <strong>structured facts</strong> into Postgres + pgvector,
+          uses 4 heat tiers (T0–T3) so frequent memories feel instant, and exposes a "Xinhua-dictionary" multi-key index
+          so any angle of asking finds the answer.
+        </p>
+        <div class="stats">
+          <div><strong>4096</strong><small>qwen3 dim</small></div>
+          <div><strong>4 tiers</strong><small>T0–T3</small></div>
+          <div><strong>7 routes</strong><small>parallel recall</small></div>
+          <div><strong>~5%</strong><small>vs old token cost</small></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>① Why tiers</h2>
+        <p>
+          Human recall of "what did I eat today and with whom" is instant — because the answer is already in working memory.
+          memory-postgres copies that idea:
+        </p>
+        <ul>
+          <li><strong>T0 working set</strong> (in-process, &lt;0.1ms) — ~50 hottest chunks per session, zero-cost hit</li>
+          <li><strong>T1 hot cache</strong> (PG UNLOGGED, ~1ms) — user-scoped recent set, shared across sessions</li>
+          <li><strong>T2 main</strong> (PG + HNSW + GIN + trgm, 5–50ms) — full long-term memory</li>
+          <li><strong>T3 cold archive</strong> (cold.gists, compressed summaries + drill-down) — historical archive</li>
+        </ul>
+        <p>Recall walks T0 first; on miss, falls through T1 / T2 / T3 and promotes hits back upward. <strong>Most queries don't actually search</strong> — the answer is already in the hottest tier.</p>
+      </section>
+
+      <section>
+        <h2>② Ingest: 6-stage pipeline</h2>
+        <p>Every piece of content entering the system runs the full pipeline:</p>
+        <ol class="stages">
+          <li><strong>Stage 1 — Trash filter</strong> (deterministic, 0 token)<span>regex / length / closing-word filters reject ~70-80% of "ok thanks"-style filler</span></li>
+          <li><strong>Stage 0 — Source-derived signals</strong> (deterministic, 0 token)<span>tool calls, anchors (cwd/branch/PR/file), time buckets → direct index signals</span></li>
+          <li><strong>Stage 2 — Sidecar JSON</strong> (0 token)<span>parse agent's <code>&lt;mem&gt;{entities,events,prefs,metrics}&lt;/mem&gt;</code> emitted at turn end</span></li>
+          <li><strong>Stage 3 — Cache lookup</strong> (0 token)<span>same-hash embeddings, entity aliases pulled from cache.*</span></li>
+          <li><strong>Stage 4 — LLM residual</strong> (rarely, ~5%)<span>only for content the prior 4 stages couldn't cover</span></li>
+          <li><strong>Stage 5 — Multi-key indexes</strong> (deterministic)<span>concept_tag / entity_ref / time_bucket / metric_name / preference_key / event_type / anchor_*</span></li>
+          <li><strong>Stage 6 — Reconcile + write</strong> (transactional)<span>entity dedup, preference supersede chain, event minute-bucket dedup, all linked via structured.provenance</span></li>
+        </ol>
+        <div class="note">
+          A typical sentence — "today with @shadow on openclaw/openclaw I shipped PR #1234 and ate 1800 cal at lunch" — produces 1 chunk + ~12 multi-key index rows + 4 structured rows (events / metrics / relations) with near-zero LLM cost.
+        </div>
+      </section>
+
+      <section>
+        <h2>③ Indexes: Xinhua-dictionary style</h2>
+        <p>A Chinese dictionary lets you find a character by pinyin (sound), radical (form), stroke count, or four-corner code — any angle works. We mirror this:</p>
+        <table class="map-table">
+          <thead><tr><th>Dictionary</th><th>Memory index</th><th>Implementation</th></tr></thead>
+          <tbody>
+            <tr><td>Pinyin</td><td>semantic vector</td><td>HNSW + qwen3-4096</td></tr>
+            <tr><td>Strokes</td><td>full-text keyword</td><td>tsvector + GIN</td></tr>
+            <tr><td>Homophone</td><td>fuzzy spelling</td><td>pg_trgm + GIST</td></tr>
+            <tr><td>Radical</td><td>concept tag</td><td><code>chunk_indexes(kind=concept_tag)</code></td></tr>
+            <tr><td>Component</td><td>entity ref</td><td><code>chunk_indexes(kind=entity_ref)</code></td></tr>
+            <tr><td>Four-corner</td><td>time bucket</td><td><code>chunk_indexes(kind=time_bucket)</code></td></tr>
+            <tr><td>—(brain only)</td><td>environment anchors</td><td><code>kind=anchor_cwd|branch|pr|file|session</code></td></tr>
+          </tbody>
+        </table>
+        <p>Every chunk <strong>always</strong> writes all relevant index rows at ingest. Whatever angle the question takes — "yesterday's PR", "the work with Shadow", "calorie intake", "what changed in that file" — it lands.</p>
+      </section>
+
+      <section>
+        <h2>④ Recall: 7 parallel routes + MMR rerank</h2>
+        <p>Each query never lets a classifier prune routes — all indexes run in parallel, results speak for themselves:</p>
+        <div class="route-grid">
+          <div class="route"><strong>semantic</strong><span>HNSW cosine on qwen3 4096-d vectors</span></div>
+          <div class="route"><strong>fulltext</strong><span>tsvector @@ tsquery, bm25 ranking</span></div>
+          <div class="route"><strong>trgm</strong><span>pg_trgm fuzzy match (typos, abbrev)</span></div>
+          <div class="route"><strong>concept_tag</strong><span>topic-tag exact / ANY match</span></div>
+          <div class="route"><strong>entity_ref</strong><span>entity-id exact match</span></div>
+          <div class="route"><strong>time_bucket</strong><span>ISO date window</span></div>
+          <div class="route"><strong>anchor</strong><span>cwd/branch/pr/file/session strong signal</span></div>
+        </div>
+        <p>The merge step normalises scores and applies <strong>MMR rerank</strong> to reduce redundancy. Anchor hits typically ~10ms 0 token; pure semantic ~250ms + 1 qwen3 RTT; cache hits ~2ms.</p>
+      </section>
+
+      <section>
+        <h2>⑤ Scoring: every event 0–100</h2>
+        <p>Each ingest / recall computes a composite score persisted to audit; the dashboard charts trends:</p>
+        <pre class="formula">
+ingest_score = 100 × (
+    0.30 × token_efficiency      // less LLM = better
+  + 0.20 × latency_efficiency    // faster = better
+  + 0.30 × quality_signal        // accept rate × extractor confidence
+  + 0.20 × path_efficiency       // deterministic &gt; cache &gt; sidecar &gt; llm
+)
+
+recall_score = 100 × (
+    0.25 × token_efficiency
+  + 0.25 × latency_efficiency
+  + 0.25 × tier_efficiency       // T0=1.0 &gt; T1=0.9 &gt; T2_anchor=0.75 &gt; T2=0.55 &gt; T3=0.2
+  + 0.25 × relevance             // was the hit actually used by the agent within 1h
+)</pre>
+        <p>Weights are configurable in <code>scoring</code>. Self-tuning (§⑦) drives proposals from these score trends.</p>
+      </section>
+
+      <section>
+        <h2>⑥ Background workers</h2>
+        <ul>
+          <li><strong>Context Primer</strong> — pre-warms T0/T1 from cwd / branch on session start</li>
+          <li><strong>Spreading Activator</strong> — async promotion of neighbours (chunks sharing entity / concept_tag) after a hit</li>
+          <li><strong>Compactor</strong> — during dream phase clusters chunks unread for 90 days by concept_tag, emits cold.gists summaries, demotes originals to ephemeral while keeping source_chunk_ids for drill-down</li>
+          <li><strong>Recall Feedback</strong> — recall_count++, warmth_score++, hit chunk_indexes.weight nudged (Hebbian-style)</li>
+          <li><strong>Tuning Analyzer</strong> — see §⑦</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>⑦ Self-tuning loop</h2>
+        <p>The system inspects audit data on cadences and proposes improvements:</p>
+        <table class="map-table">
+          <thead><tr><th>Cadence</th><th>Check</th><th>Risk class</th></tr></thead>
+          <tbody>
+            <tr><td>Daily</td><td>cache hit-rate too low → shrink TTL; too high → expand TTL</td><td>safe_auto (auto-applied)</td></tr>
+            <tr><td>Daily</td><td>boilerplate match rate low → suggest new trash regex</td><td>review_required</td></tr>
+            <tr><td>Daily</td><td>ingest score dropped &gt;20% vs last week → alert</td><td>review_required</td></tr>
+            <tr><td>Weekly</td><td>tier capacity, salience threshold calibration</td><td>review_required</td></tr>
+            <tr><td>Monthly</td><td>schema evolution, embedding upgrade</td><td>high_risk (must approve)</td></tr>
+          </tbody>
+        </table>
+        <p>Every auto-apply has a <strong>24h guard</strong>: a watcher tracks the relevant score and auto-reverts if it drops &gt;20%.</p>
+      </section>
+
+      <section>
+        <h2>⑧ Database layout</h2>
+        <p>Single Postgres 16 + pgvector + pg_trgm + btree_gin, five schemas:</p>
+        <ul>
+          <li><code>semantic.*</code> — chunks (embedding + full-text + multi-key indexes)</li>
+          <li><code>structured.*</code> — entities / relations / events / preferences / metrics + provenance</li>
+          <li><code>cache.*</code> — UNLOGGED tables: hot_chunks / embeddings / intent / recall / entity_alias</li>
+          <li><code>cold.*</code> — gists (compressed archive)</li>
+          <li><code>audit.*</code> — dream_runs / ingest_decisions / recall_decisions / tuning_proposals</li>
+        </ul>
+        <p>All structured rows carry a <code>structured.provenance</code> link back to the source chunk — "why do you think I prefer X?" becomes a SQL JOIN.</p>
+      </section>
+
+      <section>
+        <h2>⑨ Embedding endpoint</h2>
+        <p>
+          All embeddings flow through your configured embedding endpoint (set via <code>config.embedding.baseUrl</code>)
+          to a self-hosted <strong>qwen3-embedding 4096-d</strong> model.
+          OpenAI-compatible <code>/v1/embeddings</code> protocol, no token (broker authenticates by tailnet node identity).
+          Typical RTT ~250ms; cache hits cost zero.
+        </p>
+      </section>
+
+      <section>
+        <h2>⑩ Exposed agent tools</h2>
+        <ul>
+          <li><strong><code>memory_search(query, cwd?, branch?, pr?, timeBucket?, limit?)</code></strong> — long-term memory lookup. With anchors it stays on the 0-cost path</li>
+          <li><strong><code>memory_store(text, importance?, pinned?, cwd?, branch?, pr?, file?)</code></strong> — write a fact / preference / decision. Lets a Discord user say "remember X" directly</li>
+        </ul>
+      </section>
+
+      <section class="footer-note">
+        <p>Project branch: <code>memory-postgres-redesign</code> · DB: <code>127.0.0.1:55432/openclaw_memory</code> · Dashboard: this page · Full plan: <code>~/.claude/plans/openclaw-openclaw-iridescent-pudding.md</code></p>
+      </section>
+    </article>
+  </main>
+
+  <script src="/docs.js"></script>
+</body>
+</html>

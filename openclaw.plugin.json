@@ -1,0 +1,316 @@
+{
+  "id": "memory-postgres",
+  "activation": {
+    "onStartup": false
+  },
+  "kind": "memory",
+  "uiHints": {
+    "postgres.url": {
+      "label": "Postgres URL",
+      "sensitive": true,
+      "placeholder": "postgres://openclaw:***@127.0.0.1:5432/openclaw_memory",
+      "help": "Local Postgres 16+ with pgvector, pg_trgm and btree_gin extensions"
+    },
+    "embedding.provider": {
+      "label": "Embedding Provider",
+      "placeholder": "ollama",
+      "help": "Provider adapter (e.g. ollama, openai, openai-compat)"
+    },
+    "embedding.model": {
+      "label": "Embedding Model",
+      "placeholder": "qwen3-embedding:0.6b",
+      "help": "Model id; dimensions probed at startup"
+    },
+    "embedding.baseUrl": {
+      "label": "Embedding Base URL",
+      "placeholder": "http://<tailscale-host>:11434",
+      "help": "Base URL for the ollama-compatible embedding server"
+    },
+    "embedding.apiKeyEnv": {
+      "label": "Embedding API Key Env",
+      "placeholder": "OLLAMA_API_KEY",
+      "help": "Env var name holding the bearer token; not the key itself",
+      "advanced": true
+    },
+    "tiers.t0SizeLimit": {
+      "label": "T0 Working Set Size",
+      "placeholder": "50",
+      "advanced": true
+    },
+    "tiers.t1SizeLimit": {
+      "label": "T1 Hot Cache Size",
+      "placeholder": "500",
+      "advanced": true
+    },
+    "tiers.primeOnSessionStart": {
+      "label": "Prime On Session Start",
+      "help": "Pre-warm T0/T1 with anchor-relevant chunks at session start"
+    },
+    "sidecar.enabled": {
+      "label": "Sidecar Tagging",
+      "help": "Inject sidecar JSON request into agent prompt to extract structured signals"
+    },
+    "scoring.ingest.weights": {
+      "label": "Ingest Score Weights",
+      "advanced": true
+    },
+    "scoring.recall.weights": {
+      "label": "Recall Score Weights",
+      "advanced": true
+    },
+    "tuning.autoApplyEnabled": {
+      "label": "Auto-Apply Safe Tuning",
+      "help": "Allow self-tuning loop to auto-apply safe-class proposals"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["postgres", "embedding"],
+    "properties": {
+      "postgres": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url"],
+        "properties": {
+          "url": { "type": "string" },
+          "poolMax": { "type": "number", "minimum": 1, "maximum": 50 },
+          "statementTimeoutMs": { "type": "number", "minimum": 100 }
+        }
+      },
+      "embedding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "model"],
+        "properties": {
+          "provider": { "type": "string" },
+          "model": { "type": "string" },
+          "baseUrl": { "type": "string" },
+          "apiKeyEnv": { "type": "string" },
+          "dims": { "type": "number" },
+          "format": { "type": "string", "enum": ["ollama", "openai"] },
+          "path": { "type": "string" }
+        }
+      },
+      "tiers": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "t0SizeLimit": { "type": "number", "minimum": 0, "maximum": 1000 },
+          "t1SizeLimit": { "type": "number", "minimum": 0, "maximum": 100000 },
+          "t1TtlDays": { "type": "number", "minimum": 1, "maximum": 365 },
+          "warmthDecayHalflife": { "type": "number", "minimum": 1 },
+          "promotionThreshold": { "type": "number", "minimum": 1 },
+          "primeOnSessionStart": { "type": "boolean" }
+        }
+      },
+      "sidecar": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "triggers": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "minUserMessageChars": { "type": "number" },
+              "onWriteTools": { "type": "boolean" },
+              "onNumericMention": { "type": "boolean" },
+              "onExplicitRemember": { "type": "boolean" }
+            }
+          },
+          "consecutiveBadJsonDisableCount": { "type": "number" }
+        }
+      },
+      "gates": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "salience": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "minImportance": { "type": "number", "minimum": 0, "maximum": 1 },
+              "model": { "type": "string" }
+            }
+          },
+          "extractor": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "minConfidence": { "type": "number", "minimum": 0, "maximum": 1 },
+              "quarantineBelow": { "type": "boolean" }
+            }
+          },
+          "perSourceOverrides": { "type": "object" },
+          "trashRegexes": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "recall": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "intentModel": { "type": "string" },
+          "totalK": { "type": "number" },
+          "cacheRecallTtlSec": { "type": "number" },
+          "cacheIntentTtlSec": { "type": "number" }
+        }
+      },
+      "compaction": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "minAgeDays": { "type": "number" },
+          "minClusterSize": { "type": "number" },
+          "runDuringDeepDream": { "type": "boolean" }
+        }
+      },
+      "retention": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ephemeralAfterDays": { "type": "number" },
+          "neverDecayPinned": { "type": "boolean" }
+        }
+      },
+      "scoring": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ingest": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "weights": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "token":   { "type": "number" },
+                  "latency": { "type": "number" },
+                  "quality": { "type": "number" },
+                  "path":    { "type": "number" }
+                }
+              },
+              "tokenBudgetCeiling": { "type": "number" },
+              "latencyBudgetMs": { "type": "number" }
+            }
+          },
+          "recall": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "weights": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "token":     { "type": "number" },
+                  "latency":   { "type": "number" },
+                  "tier":      { "type": "number" },
+                  "relevance": { "type": "number" }
+                }
+              },
+              "tokenBudgetCeiling": { "type": "number" },
+              "latencyBudgetMs": { "type": "number" },
+              "relevanceFollowupWindowMs": { "type": "number" }
+            }
+          }
+        }
+      },
+      "tuning": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "autoApplyEnabled": { "type": "boolean" },
+          "scopes": {
+            "type": "object",
+            "additionalProperties": { "type": "string", "enum": ["auto", "review", "manual", "off"] }
+          }
+        }
+      },
+      "dashboard": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "host": { "type": "string" },
+          "port": { "type": "number" },
+          "tokenEnv": { "type": "string" }
+        }
+      },
+      "gitWatchers": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "path"],
+          "properties": {
+            "id": { "type": "string" },
+            "path": { "type": "string" },
+            "branch": { "type": "string" },
+            "remote": { "type": "string" },
+            "intervalMs": { "type": "number", "minimum": 60000 },
+            "source": { "type": "string" },
+            "anchors": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cwd": { "type": "string" },
+                "branch": { "type": "string" }
+              }
+            },
+            "gitBinary": { "type": "string" }
+          }
+        }
+      },
+      "transcriptWatchers": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "dir"],
+          "properties": {
+            "id": { "type": "string" },
+            "agentId": { "type": "string", "description": "Owning agent id; chunks ingested by this watcher are tagged for hard memory namespace isolation. Default 'main'." },
+            "dir": { "type": "string" },
+            "intervalMs": { "type": "number", "minimum": 5000 },
+            "source": { "type": "string" },
+            "maxBytesPerTick": { "type": "number", "minimum": 1024 },
+            "firstRunBackfillBytes": { "type": "number", "minimum": 0 },
+            "defaultImportance": { "type": "number", "minimum": 0, "maximum": 1 },
+            "dropPureQuestions": { "type": "boolean" },
+            "anchors": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cwd": { "type": "string" },
+                "branch": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "shadowComparators": {
+        "type": "array",
+        "description": "Background workers that replay each gpt-5.5 turn against a challenger chat endpoint (e.g. qwen3.6-35B) for side-by-side comparison. Stored in audit.model_comparisons; surfaced on dashboard.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "trajectoryDir", "baseUrl", "model"],
+          "properties": {
+            "id": { "type": "string" },
+            "trajectoryDir": { "type": "string", "description": "Path to <agent>/sessions/ holding *.trajectory.jsonl" },
+            "baseUrl": { "type": "string", "description": "Challenger endpoint (OpenAI-compatible proxy or direct endpoint)" },
+            "model": { "type": "string", "description": "Challenger model id sent in the request body" },
+            "apiKeyEnv": { "type": "string" },
+            "intervalMs": { "type": "number", "minimum": 10000 },
+            "backfillWindowMs": { "type": "number", "minimum": 0 },
+            "maxOutputTokens": { "type": "number", "minimum": 32 },
+            "requestTimeoutMs": { "type": "number", "minimum": 5000 },
+            "minUserMessageChars": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    }
+  }
+}

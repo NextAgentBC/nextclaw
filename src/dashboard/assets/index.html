@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenClaw Memory · memory-postgres</title>
+  <link rel="stylesheet" href="/dashboard.css" />
+</head>
+<body>
+  <header>
+    <div class="title">
+      <span class="logo">🦞</span>
+      <h1>OpenClaw Memory</h1>
+      <span class="subtle">memory-postgres dashboard</span>
+    </div>
+    <div class="dash-actions">
+      <a class="pill" href="/docs">📖 说明 · Docs</a>
+      <div class="status pill" id="status">connecting…</div>
+    </div>
+  </header>
+
+  <main>
+    <!-- KPI strip -->
+    <section class="kpis">
+      <div class="kpi">
+        <label>录入 · Ingests / 24h</label>
+        <strong id="kpi-ingests">—</strong>
+        <small id="kpi-ingest-detail" class="muted"></small>
+      </div>
+      <div class="kpi">
+        <label>召回 · Recalls / 24h</label>
+        <strong id="kpi-recalls">—</strong>
+        <small id="kpi-recall-detail" class="muted"></small>
+      </div>
+      <div class="kpi">
+        <label>召回评分 · Recall score</label>
+        <strong id="kpi-recall-score">—</strong>
+        <small class="muted">0–100 加权</small>
+      </div>
+      <div class="kpi">
+        <label>召回延迟 · Recall latency</label>
+        <strong id="kpi-recall-lat">—</strong>
+        <small class="muted">ms · p50 加权</small>
+      </div>
+      <div class="kpi">
+        <label>LLM tokens / 24h</label>
+        <strong id="kpi-tokens">—</strong>
+        <small class="muted">录入 + 召回</small>
+      </div>
+      <div class="kpi">
+        <label>Embed RTT / 24h</label>
+        <strong id="kpi-embed">—</strong>
+        <small class="muted">qwen3-embedding</small>
+      </div>
+    </section>
+
+    <!-- Row 1: ingest decisions + recall tiers + live stream -->
+    <div class="row">
+      <section class="card">
+        <h2><span>录入决策 · Ingest decisions</span><span class="muted">last 24h</span></h2>
+        <div id="ingest-bars" class="bar-list"></div>
+      </section>
+
+      <section class="card">
+        <h2><span>召回分层 · Recall tier hits</span><span class="muted">last 24h</span></h2>
+        <div id="recall-bars" class="bar-list"></div>
+      </section>
+
+      <section class="card live">
+        <h2><span>实时事件流 · Live event stream</span></h2>
+        <ul id="stream"><li class="empty">等待事件 · waiting for events…</li></ul>
+      </section>
+    </div>
+
+    <!-- Row 1.5: bot turn telemetry (where does the perceived latency come from?) -->
+    <section class="card wide bot-card">
+      <h2>
+        <span>Bot 回复延迟 · Bot turn latency</span>
+        <span class="muted" id="bot-stats-meta">last 24h · openai-codex/gpt-5.5</span>
+      </h2>
+      <div class="bot-kpis">
+        <div class="kpi-mini">
+          <label>turns</label>
+          <strong id="bot-count">—</strong>
+          <small class="muted">总条数</small>
+        </div>
+        <div class="kpi-mini">
+          <label>p50 latency</label>
+          <strong id="bot-p50">—</strong>
+          <small class="muted">中位 model 延迟</small>
+        </div>
+        <div class="kpi-mini">
+          <label>p90 latency</label>
+          <strong id="bot-p90">—</strong>
+          <small class="muted">尾部 model 延迟</small>
+        </div>
+        <div class="kpi-mini">
+          <label>max latency</label>
+          <strong id="bot-max">—</strong>
+          <small class="muted">最慢一次</small>
+        </div>
+        <div class="kpi-mini">
+          <label>cold-start</label>
+          <strong id="bot-cold">—</strong>
+          <small class="muted">> 5 min cache miss</small>
+        </div>
+        <div class="kpi-mini">
+          <label>output tokens</label>
+          <strong id="bot-out">—</strong>
+          <small class="muted">生成总量</small>
+        </div>
+        <div class="kpi-mini">
+          <label>input fresh</label>
+          <strong id="bot-in">—</strong>
+          <small class="muted">未命中缓存</small>
+        </div>
+        <div class="kpi-mini">
+          <label>cacheRead</label>
+          <strong id="bot-cache">—</strong>
+          <small class="muted">prompt-cache 命中</small>
+        </div>
+      </div>
+      <div class="scroll-x">
+        <table id="bot-table">
+          <thead><tr>
+            <th>时间·Time</th>
+            <th class="num">model ms</th>
+            <th class="num">total ms</th>
+            <th class="num">in</th>
+            <th class="num">out</th>
+            <th class="num">cache</th>
+            <th>cold</th>
+            <th>tools</th>
+          </tr></thead>
+          <tbody><tr class="empty"><td colspan="8">暂无 turn · no turns yet</td></tr></tbody>
+        </table>
+      </div>
+      <p class="card-note">
+        看到 "is typing…" 等很久？检查 <strong>p90</strong>（OpenAI 慢）和 <strong>cold-start %</strong>（5 分钟没说话 → prompt cache miss → 重新 prefill 6 万+ token）。
+        memory 层延迟在录入/召回卡面板里看，与此独立。
+        <br>
+        Wondering why "is typing…" hangs? Check <strong>p90</strong> (OpenAI tail latency) and <strong>cold-start %</strong> (5-min idle → prompt cache miss → 60K+ token reprefill). Memory-layer latency is separately tracked above.
+      </p>
+    </section>
+
+    <!-- Row 2: category distribution (full width — central new dimension) -->
+    <section class="card wide category-card">
+      <h2>
+        <span>分类分布 · Category distribution</span>
+        <span class="muted">所有 chunks · 🔒 = 隐私自动 pinned (health/medical)</span>
+      </h2>
+      <div id="category-bars" class="bar-list category-bars"></div>
+      <p class="card-note">
+        每条记忆基于 deterministic 词典自动多标签分类（中英双语规则，0 LLM tokens）。
+        <strong>health</strong> / <strong>medical</strong> 类自动 pinned + importance ≥ 0.7，
+        在 dashboard 上正文 redacted。
+        <br>
+        Each chunk is auto-classified via a deterministic CN/EN keyword dictionary (multi-label, 0 LLM).
+        <strong>Health</strong> / <strong>medical</strong> chunks are auto-pinned with importance ≥ 0.7;
+        their excerpts are redacted in this dashboard.
+      </p>
+    </section>
+
+    <!-- Model comparison: gpt-5.5 vs challengers (shadow runs) -->
+    <section class="card wide compare-card">
+      <h2>
+        <span>模型对比 · Model comparison <span class="muted">shadow mode</span></span>
+        <span class="muted" id="compare-meta">last 24h</span>
+      </h2>
+      <div id="compare-aggregates" class="compare-aggs"></div>
+      <div class="scroll-x">
+        <table id="compare-table">
+          <thead><tr>
+            <th>时间·Time</th>
+            <th>用户问·User</th>
+            <th class="num">gpt-5.5 ms</th>
+            <th class="num">挑战者 ms</th>
+            <th class="num">×倍速</th>
+            <th class="num">tokens (in/out)</th>
+            <th>gpt-5.5 输出</th>
+            <th>挑战者输出</th>
+          </tr></thead>
+          <tbody><tr class="empty"><td colspan="8">暂无影子对比数据 · no shadow data yet</td></tr></tbody>
+        </table>
+      </div>
+      <p class="card-note">
+        每条 gpt-5.5 turn 在被 OpenAI 处理后，shadow comparator 会把<strong>同样的 prompt + messages</strong>异步发给挑战者（默认 qwen3.6-35B-A3B），不影响 Discord 实时回复。
+        速度比 &gt;1 表示挑战者更快；输出长度可作为初步质量参考——内容差异请抽样人工对比。
+        <br>
+        Each gpt-5.5 turn is replayed asynchronously against the challenger model with the same prompt + message history. Speed-ratio &gt;1 means the challenger is faster. Output length is a rough quality proxy — eyeball the content for actual quality differences.
+      </p>
+    </section>
+
+    <!-- Recent ingests table -->
+    <section class="card wide">
+      <h2><span>最近录入 · Recent ingests</span><span class="muted">latest 50</span></h2>
+      <div class="scroll-x">
+        <table id="ingest-table">
+          <thead><tr>
+            <th>时间·Time</th>
+            <th>决策·Decision</th>
+            <th>路径·Path</th>
+            <th>分类·Categories</th>
+            <th class="num">tokens</th>
+            <th class="num">latency</th>
+            <th class="num">score</th>
+            <th>正文·Excerpt</th>
+          </tr></thead>
+          <tbody><tr class="empty"><td colspan="8">no ingest events yet · 暂无录入事件</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Recent recalls table -->
+    <section class="card wide">
+      <h2><span>最近召回 · Recent recalls</span><span class="muted">latest 50</span></h2>
+      <div class="scroll-x">
+        <table id="recall-table">
+          <thead><tr>
+            <th>时间·Time</th>
+            <th>分层·Tier</th>
+            <th class="num">returned</th>
+            <th class="num">tokens</th>
+            <th class="num">embed</th>
+            <th class="num">latency</th>
+            <th class="num">score</th>
+            <th>查询·Query</th>
+          </tr></thead>
+          <tbody><tr class="empty"><td colspan="8">no recall events yet · 暂无召回事件</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span class="muted">
+      tier-walk T0 → T1 → T2 → T3 · 多键索引"新华字典" · qwen3-embedding 4096d
+    </span>
+  </footer>
+
+  <script src="/dashboard.js" type="module"></script>
+</body>
+</html>

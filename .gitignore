@@ -1,0 +1,37 @@
+node_modules/
+dist/
+*.log
+
+# Build artifacts
+.tsbuildinfo
+*.tsbuildinfo
+.cache/
+coverage/
+.vitest/
+.experimental-vitest-cache/
+
+# Local Postgres data (when running dev/docker-compose.yml against host volume)
+dev/data/
+dev/pgdata/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test pollution
+/tmp/
+*.swp
+*.bak
+
+# Personal config that should never be committed
+**/openclaw.json
+**/.dashboard.env
+**/auth-profiles.json
+**/auth-state.json

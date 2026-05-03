@@ -1,0 +1,26 @@
+nextclaw
+Copyright 2026 NextAgentBC
+
+This product includes software developed by NextAgentBC.
+
+This product builds on top of OpenClaw (https://github.com/openclaw/openclaw),
+licensed under the Apache License, Version 2.0. nextclaw integrates with
+OpenClaw via its public Plugin SDK and re-uses the following interfaces and
+helpers from OpenClaw:
+
+  - openclaw/plugin-sdk/memory-core-host-runtime-core (MemoryPluginRuntime,
+    MemoryPromptSectionBuilder)
+  - openclaw/plugin-sdk/memory-core-host-engine-storage (MemorySearchManager)
+  - openclaw/plugin-sdk/memory-core-host-engine-embeddings
+    (MemoryEmbeddingProviderAdapter)
+  - openclaw/plugin-sdk/plugin-entry (definePluginEntry, OpenClawPluginApi)
+  - openclaw/plugin-sdk/agent-runtime
+  - openclaw/plugin-sdk/runtime-env
+  - openclaw/plugin-sdk/config-types
+  - openclaw/plugin-sdk/session-store-runtime
+  - openclaw/plugin-sdk/temp-path
+  - openclaw/plugin-sdk/routing
+
+The OpenClaw project is © its respective contributors. See
+https://github.com/openclaw/openclaw/blob/main/NOTICE and
+https://github.com/openclaw/openclaw/blob/main/LICENSE for details.

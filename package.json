@@ -1,0 +1,59 @@
+{
+  "name": "nextclaw",
+  "version": "0.1.0",
+  "description": "Postgres + pgvector long-term memory plugin for OpenClaw — 4-tier recall (T0/T1/T2/T3), multi-key Xinhua-dictionary indexing, deterministic-first ingest, self-tuning loop, and a real-time dashboard.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "NextAgentBC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NextAgentBC/nextclaw"
+  },
+  "homepage": "https://github.com/NextAgentBC/nextclaw#readme",
+  "bugs": {
+    "url": "https://github.com/NextAgentBC/nextclaw/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "memory",
+    "postgres",
+    "pgvector",
+    "rag",
+    "long-term-memory",
+    "vector-search",
+    "hnsw",
+    "multi-agent",
+    "ai-agent"
+  ],
+  "files": [
+    "index.ts",
+    "manager-runtime.ts",
+    "api.ts",
+    "src/",
+    "openclaw.plugin.json",
+    "AGENTS.md",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dependencies": {
+    "pg": "^8.13.0",
+    "pgvector": "^0.2.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.4.25"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": false
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,50 @@
+# Local development Postgres for the nextclaw memory plugin.
+# Usage:
+#   cd dev
+#   docker compose up -d
+#   # PG ready at postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw
+#
+# Image: pgvector/pgvector pins both Postgres and pgvector versions.
+# The init.d/ script installs pg_trgm + btree_gin alongside pgvector.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: nextclaw-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nextclaw
+      POSTGRES_PASSWORD: nextclaw
+      POSTGRES_DB: nextclaw
+      # Safe defaults for personal local use. Tune for prod via an override file.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=C.UTF-8"
+    ports:
+      # Host port 55432 → container 5432. Avoids clashing with any other PG
+      # already bound on the canonical port.
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - nextclaw_pg:/var/lib/postgresql/data
+      - ./init.d:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextclaw -d nextclaw"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - log_min_duration_statement=200
+      - -c
+      - max_connections=100
+
+volumes:
+  nextclaw_pg:
+    name: nextclaw_pg

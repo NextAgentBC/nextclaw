@@ -1,0 +1,389 @@
+/**
+ * memory-postgres plugin config: TypeScript types + plain runtime guards.
+ *
+ * The authoritative schema is in openclaw.plugin.json; OpenClaw validates raw
+ * config there before this module ever sees it. resolveConfig() applies
+ * defaults; validateConfig() exists for tests and defensive runtime use.
+ */
+
+export type MemoryPostgresConfig = {
+  postgres: {
+    url: string;
+    poolMax?: number;
+    statementTimeoutMs?: number;
+  };
+  embedding: {
+    provider: string;
+    model: string;
+    baseUrl?: string;
+    apiKeyEnv?: string;
+    dims?: number;
+    /** "ollama" | "openai" — wire format. Default ollama. */
+    format?: "ollama" | "openai";
+    /** Optional override for the embed POST path. */
+    path?: string;
+    /**
+     * Max characters of input text to send to the embedding endpoint. Long
+     * texts get truncated to this length BEFORE embed; the full text still
+     * lives in semantic.chunks.text, recoverable via tsvector / trgm.
+     * Default 2000 — cuts long-reply ingest latency by 50-70% with minimal
+     * recall quality loss (the gist is almost always in the first 2 KB).
+     */
+    maxEmbedChars?: number;
+  };
+  tiers?: {
+    t0SizeLimit?: number;
+    t1SizeLimit?: number;
+    t1TtlDays?: number;
+    warmthDecayHalflife?: number;
+    promotionThreshold?: number;
+    primeOnSessionStart?: boolean;
+  };
+  sidecar?: {
+    enabled?: boolean;
+    triggers?: {
+      minUserMessageChars?: number;
+      onWriteTools?: boolean;
+      onNumericMention?: boolean;
+      onExplicitRemember?: boolean;
+    };
+    consecutiveBadJsonDisableCount?: number;
+  };
+  gates?: Record<string, unknown>;
+  recall?: Record<string, unknown>;
+  compaction?: Record<string, unknown>;
+  retention?: Record<string, unknown>;
+  scoring?: {
+    ingest?: {
+      weights?: { token?: number; latency?: number; quality?: number; path?: number };
+      tokenBudgetCeiling?: number;
+      latencyBudgetMs?: number;
+    };
+    recall?: {
+      weights?: { token?: number; latency?: number; tier?: number; relevance?: number };
+      tokenBudgetCeiling?: number;
+      latencyBudgetMs?: number;
+      relevanceFollowupWindowMs?: number;
+    };
+  };
+  tuning?: {
+    autoApplyEnabled?: boolean;
+    scopes?: Record<string, "auto" | "review" | "manual" | "off">;
+  };
+  dashboard?: {
+    enabled?: boolean;
+    host?: string;
+    port?: number;
+    tokenEnv?: string;
+  };
+  /**
+   * Plugin-internal git watchers. Each entry polls a local repo on its own
+   * interval and ingests new commits since last_sha — fully deterministic,
+   * no agent involvement. Persisted last-sha lives in audit.plugin_meta.
+   */
+  gitWatchers?: GitWatcherConfig[];
+  /**
+   * Plugin-internal transcript watchers. Each entry polls a directory of
+   * session JSONL files (`~/.openclaw/agents/<agentId>/sessions/`) and
+   * ingests every user / assistant message line. This is what makes the
+   * recall pipeline truly "user-invisible" — every conversation turn
+   * lands in memory without the agent having to call memory_store.
+   */
+  transcriptWatchers?: TranscriptWatcherConfig[];
+  /**
+   * Shadow-mode model comparators. For every gpt-5.5 turn observed in the
+   * agent trajectory file, replays the same prompt against a challenger
+   * chat endpoint and stores both sides in `audit.model_comparisons`. Used
+   * to compare gpt-5.5 vs qwen3.6-35B etc. without affecting the live reply.
+   */
+  shadowComparators?: ShadowComparatorConfig[];
+};
+
+export type ShadowComparatorConfig = {
+  /** Stable id (used as audit.plugin_meta key prefix). */
+  id: string;
+  /** Path to agent's session dir (containing *.trajectory.jsonl). */
+  trajectoryDir: string;
+  /** Challenger chat endpoint (OpenAI-compatible). */
+  baseUrl: string;
+  /** Challenger model id sent in the request body. */
+  model: string;
+  /** Optional Bearer token env name. */
+  apiKeyEnv?: string;
+  /** Poll interval. Default 30s. Min 10s. */
+  intervalMs?: number;
+  /** Skip turns older than this many ms at startup. Default 24h. */
+  backfillWindowMs?: number;
+  /** Cap output tokens for shadow runs. Default 400 (we just want the answer, not extended thinking). */
+  maxOutputTokens?: number;
+  /** Per-request timeout. Default 90s. */
+  requestTimeoutMs?: number;
+  /** Don't run shadow if user message length below this. Default 0 (always run). */
+  minUserMessageChars?: number;
+};
+
+export type TranscriptWatcherConfig = {
+  id: string;
+  /**
+   * Owning agent id — every chunk ingested by this watcher gets `agent_id`
+   * set to this value, providing hard memory namespace isolation.
+   * Default 'main' for back-compat.
+   */
+  agentId?: string;
+  /** Directory containing `<sessionId>.jsonl` files. */
+  dir: string;
+  /** Poll interval. Default 10s. Min enforced 5s. */
+  intervalMs?: number;
+  /** Source label prefix; full label is `<source>:<role>`. Default "session". */
+  source?: string;
+  /** Cap bytes-read per tick per file. Default 256 KB. */
+  maxBytesPerTick?: number;
+  /** Static anchors merged into every ingested message. */
+  anchors?: { cwd?: string; branch?: string };
+  /**
+   * On a session's FIRST poll (no persisted offset), how far back to read.
+   * Avoids flooding memory with the full transcript history when watcher
+   * starts for the first time. Default 64 KB ≈ a few hundred messages.
+   * Set to 0 to disable backfill entirely (only catch new messages going forward).
+   */
+  firstRunBackfillBytes?: number;
+  /** Default importance for session ingests. Default 0.35 — lower than manual writes so they decay first. */
+  defaultImportance?: number;
+  /** When true, skip user messages whose entire content is a question (ends with ? or 吗/呢/嘛). */
+  dropPureQuestions?: boolean;
+};
+
+export type GitWatcherConfig = {
+  /** Stable id; persisted last-sha key uses this. */
+  id: string;
+  /** Repo path on disk. */
+  path: string;
+  /** Branch to watch (default `main`). */
+  branch?: string;
+  /** Remote name (default `origin`). */
+  remote?: string;
+  /** How often to poll. Default 1 hour. */
+  intervalMs?: number;
+  /** Source label for ingested chunks. Default `git`. */
+  source?: string;
+  /** Static anchors merged into every ingested commit. */
+  anchors?: { cwd?: string; branch?: string };
+  /** Pin to a specific shell git binary; default `git`. */
+  gitBinary?: string;
+};
+
+export type ResolvedMemoryPostgresConfig = {
+  postgres: { url: string; poolMax: number; statementTimeoutMs: number };
+  embedding: {
+    provider: string;
+    model: string;
+    baseUrl?: string;
+    apiKeyEnv?: string;
+    dims?: number;
+    format?: "ollama" | "openai";
+    path?: string;
+    maxEmbedChars: number;
+  };
+  tiers: {
+    t0SizeLimit: number;
+    t1SizeLimit: number;
+    t1TtlDays: number;
+    warmthDecayHalflife: number;
+    promotionThreshold: number;
+    primeOnSessionStart: boolean;
+  };
+  scoring: {
+    ingest: {
+      weights: { token: number; latency: number; quality: number; path: number };
+      tokenBudgetCeiling: number;
+      latencyBudgetMs: number;
+    };
+    recall: {
+      weights: { token: number; latency: number; tier: number; relevance: number };
+      tokenBudgetCeiling: number;
+      latencyBudgetMs: number;
+      relevanceFollowupWindowMs: number;
+    };
+  };
+  dashboard: { enabled: boolean; host: string; port: number; tokenEnv?: string };
+  tuning: { autoApplyEnabled: boolean };
+  gitWatchers: ResolvedGitWatcher[];
+  transcriptWatchers: ResolvedTranscriptWatcher[];
+  shadowComparators: ResolvedShadowComparator[];
+};
+
+export type ResolvedShadowComparator = {
+  id: string;
+  trajectoryDir: string;
+  baseUrl: string;
+  model: string;
+  apiKeyEnv?: string;
+  intervalMs: number;
+  backfillWindowMs: number;
+  maxOutputTokens: number;
+  requestTimeoutMs: number;
+  minUserMessageChars: number;
+};
+
+export type ResolvedTranscriptWatcher = {
+  id: string;
+  agentId: string;
+  dir: string;
+  intervalMs: number;
+  source: string;
+  maxBytesPerTick: number;
+  firstRunBackfillBytes: number;
+  defaultImportance: number;
+  dropPureQuestions: boolean;
+  anchors?: { cwd?: string; branch?: string };
+};
+
+export type ResolvedGitWatcher = {
+  id: string;
+  path: string;
+  branch: string;
+  remote: string;
+  intervalMs: number;
+  source: string;
+  anchors: { cwd: string; branch: string };
+  gitBinary: string;
+};
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+const isString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+
+const num = (v: unknown, d: number): number =>
+  typeof v === "number" && Number.isFinite(v) ? v : d;
+const bool = (v: unknown, d: boolean): boolean => (typeof v === "boolean" ? v : d);
+
+/**
+ * Defensive runtime check; matches the JSON schema in openclaw.plugin.json.
+ * Throws with a path-prefixed message on failure.
+ */
+export function validateConfig(raw: unknown): asserts raw is MemoryPostgresConfig {
+  if (!isObject(raw)) {throw new Error("config: not an object");}
+  const pg = (raw as MemoryPostgresConfig).postgres;
+  if (!isObject(pg)) {throw new Error("config.postgres: required");}
+  if (!isString(pg.url)) {throw new Error("config.postgres.url: required string");}
+  const em = (raw as MemoryPostgresConfig).embedding;
+  if (!isObject(em)) {throw new Error("config.embedding: required");}
+  if (!isString(em.provider)) {throw new Error("config.embedding.provider: required string");}
+  if (!isString(em.model)) {throw new Error("config.embedding.model: required string");}
+}
+
+export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgresConfig {
+  const tiers = raw.tiers ?? {};
+  const scoring = raw.scoring ?? {};
+  const ingestScoring = scoring.ingest ?? {};
+  const recallScoring = scoring.recall ?? {};
+  const dashboard = raw.dashboard ?? {};
+  const tuning = raw.tuning ?? {};
+
+  return {
+    postgres: {
+      url: raw.postgres.url,
+      poolMax: num(raw.postgres.poolMax, 8),
+      statementTimeoutMs: num(raw.postgres.statementTimeoutMs, 30_000),
+    },
+    embedding: {
+      provider: raw.embedding.provider,
+      model: raw.embedding.model,
+      baseUrl: raw.embedding.baseUrl,
+      apiKeyEnv: raw.embedding.apiKeyEnv,
+      dims: raw.embedding.dims,
+      format: raw.embedding.format,
+      path: raw.embedding.path,
+      maxEmbedChars: Math.max(100, num(raw.embedding.maxEmbedChars, 2000)),
+    },
+    tiers: {
+      t0SizeLimit: num(tiers.t0SizeLimit, 50),
+      t1SizeLimit: num(tiers.t1SizeLimit, 500),
+      t1TtlDays: num(tiers.t1TtlDays, 7),
+      warmthDecayHalflife: num(tiers.warmthDecayHalflife, 14),
+      promotionThreshold: num(tiers.promotionThreshold, 2),
+      primeOnSessionStart: bool(tiers.primeOnSessionStart, true),
+    },
+    scoring: {
+      ingest: {
+        weights: {
+          token: num(ingestScoring.weights?.token, 0.30),
+          latency: num(ingestScoring.weights?.latency, 0.20),
+          quality: num(ingestScoring.weights?.quality, 0.30),
+          path: num(ingestScoring.weights?.path, 0.20),
+        },
+        tokenBudgetCeiling: num(ingestScoring.tokenBudgetCeiling, 1000),
+        latencyBudgetMs: num(ingestScoring.latencyBudgetMs, 500),
+      },
+      recall: {
+        weights: {
+          token: num(recallScoring.weights?.token, 0.25),
+          latency: num(recallScoring.weights?.latency, 0.25),
+          tier: num(recallScoring.weights?.tier, 0.25),
+          relevance: num(recallScoring.weights?.relevance, 0.25),
+        },
+        tokenBudgetCeiling: num(recallScoring.tokenBudgetCeiling, 500),
+        latencyBudgetMs: num(recallScoring.latencyBudgetMs, 200),
+        relevanceFollowupWindowMs: num(recallScoring.relevanceFollowupWindowMs, 3_600_000),
+      },
+    },
+    dashboard: {
+      enabled: bool(dashboard.enabled, false),
+      host: typeof dashboard.host === "string" ? dashboard.host : "127.0.0.1",
+      port: num(dashboard.port, 8765),
+      tokenEnv: dashboard.tokenEnv,
+    },
+    tuning: { autoApplyEnabled: bool(tuning.autoApplyEnabled, false) },
+    gitWatchers: (raw.gitWatchers ?? []).map(resolveGitWatcher),
+    transcriptWatchers: (raw.transcriptWatchers ?? []).map(resolveTranscriptWatcher),
+    shadowComparators: (raw.shadowComparators ?? []).map(resolveShadowComparator),
+  };
+}
+
+function resolveShadowComparator(c: ShadowComparatorConfig): ResolvedShadowComparator {
+  return {
+    id: c.id,
+    trajectoryDir: c.trajectoryDir,
+    baseUrl: c.baseUrl,
+    model: c.model,
+    apiKeyEnv: c.apiKeyEnv,
+    intervalMs: Math.max(10_000, num(c.intervalMs, 30_000)),
+    backfillWindowMs: num(c.backfillWindowMs, 24 * 60 * 60_000),
+    maxOutputTokens: num(c.maxOutputTokens, 400),
+    requestTimeoutMs: num(c.requestTimeoutMs, 90_000),
+    minUserMessageChars: num(c.minUserMessageChars, 0),
+  };
+}
+
+function resolveTranscriptWatcher(w: TranscriptWatcherConfig): ResolvedTranscriptWatcher {
+  return {
+    id: w.id,
+    agentId: isString(w.agentId) ? w.agentId : "main",
+    dir: w.dir,
+    intervalMs: Math.max(5000, num(w.intervalMs, 10_000)),
+    source: isString(w.source) ? w.source : "session",
+    maxBytesPerTick: num(w.maxBytesPerTick, 256 * 1024),
+    firstRunBackfillBytes: num(w.firstRunBackfillBytes, 64 * 1024),
+    defaultImportance: Math.max(0, Math.min(1, num(w.defaultImportance, 0.35))),
+    dropPureQuestions: bool(w.dropPureQuestions, true),
+    anchors: w.anchors,
+  };
+}
+
+function resolveGitWatcher(w: GitWatcherConfig): ResolvedGitWatcher {
+  const branch = isString(w.branch) ? w.branch : "main";
+  return {
+    id: w.id,
+    path: w.path,
+    branch,
+    remote: isString(w.remote) ? w.remote : "origin",
+    intervalMs: num(w.intervalMs, 60 * 60 * 1000), // 1h default
+    source: isString(w.source) ? w.source : "git",
+    anchors: {
+      cwd: w.anchors?.cwd ?? w.path,
+      branch: w.anchors?.branch ?? branch,
+    },
+    gitBinary: isString(w.gitBinary) ? w.gitBinary : "git",
+  };
+}
