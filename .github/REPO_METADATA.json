@@ -1,0 +1,26 @@
+{
+  "_comment": "Apply via GitHub UI (Settings → top-level fields) or via PATCH /repos/NextAgentBC/nextclaw",
+  "description": "Postgres + pgvector long-term memory plugin for OpenClaw. 4-tier recall, multi-key Xinhua-dictionary indexing, deterministic-first ingest, hard per-agent isolation, real-time dashboard.",
+  "homepage": "https://nextagent.ca",
+  "topics": [
+    "openclaw",
+    "memory",
+    "postgres",
+    "pgvector",
+    "long-term-memory",
+    "vector-search",
+    "hnsw",
+    "rag",
+    "ai-agent",
+    "multi-agent",
+    "discord-bot",
+    "self-hosted"
+  ],
+  "_release": {
+    "tag_name": "v0.1.0",
+    "name": "v0.1.0 — initial public release",
+    "body_file": ".github/RELEASE_NOTES_v0.1.0.md",
+    "draft": false,
+    "prerelease": false
+  }
+}
