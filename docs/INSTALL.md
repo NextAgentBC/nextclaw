@@ -83,6 +83,45 @@ curl -sS http://127.0.0.1:11434/v1/embeddings \
 > The dimension is detected on first embed call and locked into the HNSW
 > index, so picking the dimension up front is **not** required.
 
+### Alternative: hosted embedding (no local model, no GPU)
+
+If you do not want to run a local model, any OpenAI-compatible
+`/v1/embeddings` endpoint works. Two free options as of 2026:
+
+**[Jina AI](https://jina.ai/embeddings/)** — `jina-embeddings-v3`,
+1024-dim, multilingual including Chinese. Free tier: 1M tokens per key
+(non-commercial). Drop-in OpenAI schema:
+
+```bash
+curl -sS https://api.jina.ai/v1/embeddings \
+  -H "Authorization: Bearer $JINA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"jina-embeddings-v3","input":["hello"]}'
+```
+
+Then in `~/.openclaw/openclaw.json`:
+
+```jsonc
+"embedding": {
+  "provider": "jina",
+  "model": "jina-embeddings-v3",
+  "baseUrl": "https://api.jina.ai",
+  "format": "openai",
+  "path": "/v1/embeddings",
+  "apiKeyEnv": "JINA_API_KEY",
+  "dims": 1024
+}
+```
+
+**[Google Gemini](https://ai.google.dev/gemini-api/docs/embeddings)** —
+`text-embedding-004`, 768-dim. Continuously renewing free tier (RPM
+limited). Requires an OpenAI-compatible shim or direct Gemini SDK use.
+
+**Multi-key rotation**: if you exceed a single Jina key, a thin proxy
+that rotates between keys on 429 keeps you within free tier. See the
+NextClaw community examples for a small Node proxy that does this while
+exposing a single OpenAI-compatible endpoint.
+
 ---
 
 ## ④ Install nextclaw into OpenClaw's `extensions/`
