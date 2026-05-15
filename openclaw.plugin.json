@@ -66,60 +66,132 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["postgres", "embedding"],
+    "required": [
+      "postgres",
+      "embedding"
+    ],
     "properties": {
       "postgres": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["url"],
+        "required": [
+          "url"
+        ],
         "properties": {
-          "url": { "type": "string" },
-          "poolMax": { "type": "number", "minimum": 1, "maximum": 50 },
-          "statementTimeoutMs": { "type": "number", "minimum": 100 }
+          "url": {
+            "type": "string"
+          },
+          "poolMax": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 50
+          },
+          "statementTimeoutMs": {
+            "type": "number",
+            "minimum": 100
+          }
         }
       },
       "embedding": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["provider", "model"],
+        "required": [
+          "provider",
+          "model"
+        ],
         "properties": {
-          "provider": { "type": "string" },
-          "model": { "type": "string" },
-          "baseUrl": { "type": "string" },
-          "apiKeyEnv": { "type": "string" },
-          "dims": { "type": "number" },
-          "format": { "type": "string", "enum": ["ollama", "openai"] },
-          "path": { "type": "string" }
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "baseUrl": {
+            "type": "string"
+          },
+          "apiKeyEnv": {
+            "type": "string"
+          },
+          "dims": {
+            "type": "number"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "ollama",
+              "openai"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "maxEmbedChars": {
+            "type": "number",
+            "minimum": 100,
+            "maximum": 100000
+          }
         }
       },
       "tiers": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "t0SizeLimit": { "type": "number", "minimum": 0, "maximum": 1000 },
-          "t1SizeLimit": { "type": "number", "minimum": 0, "maximum": 100000 },
-          "t1TtlDays": { "type": "number", "minimum": 1, "maximum": 365 },
-          "warmthDecayHalflife": { "type": "number", "minimum": 1 },
-          "promotionThreshold": { "type": "number", "minimum": 1 },
-          "primeOnSessionStart": { "type": "boolean" }
+          "t0SizeLimit": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "t1SizeLimit": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100000
+          },
+          "t1TtlDays": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 365
+          },
+          "warmthDecayHalflife": {
+            "type": "number",
+            "minimum": 1
+          },
+          "promotionThreshold": {
+            "type": "number",
+            "minimum": 1
+          },
+          "primeOnSessionStart": {
+            "type": "boolean"
+          }
         }
       },
       "sidecar": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
+          "enabled": {
+            "type": "boolean"
+          },
           "triggers": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "minUserMessageChars": { "type": "number" },
-              "onWriteTools": { "type": "boolean" },
-              "onNumericMention": { "type": "boolean" },
-              "onExplicitRemember": { "type": "boolean" }
+              "minUserMessageChars": {
+                "type": "number"
+              },
+              "onWriteTools": {
+                "type": "boolean"
+              },
+              "onNumericMention": {
+                "type": "boolean"
+              },
+              "onExplicitRemember": {
+                "type": "boolean"
+              }
             }
           },
-          "consecutiveBadJsonDisableCount": { "type": "number" }
+          "consecutiveBadJsonDisableCount": {
+            "type": "number"
+          }
         }
       },
       "gates": {
@@ -130,48 +202,87 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "minImportance": { "type": "number", "minimum": 0, "maximum": 1 },
-              "model": { "type": "string" }
+              "minImportance": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "model": {
+                "type": "string"
+              }
             }
           },
           "extractor": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "minConfidence": { "type": "number", "minimum": 0, "maximum": 1 },
-              "quarantineBelow": { "type": "boolean" }
+              "minConfidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "quarantineBelow": {
+                "type": "boolean"
+              }
             }
           },
-          "perSourceOverrides": { "type": "object" },
-          "trashRegexes": { "type": "array", "items": { "type": "string" } }
+          "perSourceOverrides": {
+            "type": "object"
+          },
+          "trashRegexes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       },
       "recall": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "intentModel": { "type": "string" },
-          "totalK": { "type": "number" },
-          "cacheRecallTtlSec": { "type": "number" },
-          "cacheIntentTtlSec": { "type": "number" }
+          "intentModel": {
+            "type": "string"
+          },
+          "totalK": {
+            "type": "number"
+          },
+          "cacheRecallTtlSec": {
+            "type": "number"
+          },
+          "cacheIntentTtlSec": {
+            "type": "number"
+          }
         }
       },
       "compaction": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "minAgeDays": { "type": "number" },
-          "minClusterSize": { "type": "number" },
-          "runDuringDeepDream": { "type": "boolean" }
+          "enabled": {
+            "type": "boolean"
+          },
+          "minAgeDays": {
+            "type": "number"
+          },
+          "minClusterSize": {
+            "type": "number"
+          },
+          "runDuringDeepDream": {
+            "type": "boolean"
+          }
         }
       },
       "retention": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "ephemeralAfterDays": { "type": "number" },
-          "neverDecayPinned": { "type": "boolean" }
+          "ephemeralAfterDays": {
+            "type": "number"
+          },
+          "neverDecayPinned": {
+            "type": "boolean"
+          }
         }
       },
       "scoring": {
@@ -186,14 +297,26 @@
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                  "token":   { "type": "number" },
-                  "latency": { "type": "number" },
-                  "quality": { "type": "number" },
-                  "path":    { "type": "number" }
+                  "token": {
+                    "type": "number"
+                  },
+                  "latency": {
+                    "type": "number"
+                  },
+                  "quality": {
+                    "type": "number"
+                  },
+                  "path": {
+                    "type": "number"
+                  }
                 }
               },
-              "tokenBudgetCeiling": { "type": "number" },
-              "latencyBudgetMs": { "type": "number" }
+              "tokenBudgetCeiling": {
+                "type": "number"
+              },
+              "latencyBudgetMs": {
+                "type": "number"
+              }
             }
           },
           "recall": {
@@ -204,15 +327,29 @@
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                  "token":     { "type": "number" },
-                  "latency":   { "type": "number" },
-                  "tier":      { "type": "number" },
-                  "relevance": { "type": "number" }
+                  "token": {
+                    "type": "number"
+                  },
+                  "latency": {
+                    "type": "number"
+                  },
+                  "tier": {
+                    "type": "number"
+                  },
+                  "relevance": {
+                    "type": "number"
+                  }
                 }
               },
-              "tokenBudgetCeiling": { "type": "number" },
-              "latencyBudgetMs": { "type": "number" },
-              "relevanceFollowupWindowMs": { "type": "number" }
+              "tokenBudgetCeiling": {
+                "type": "number"
+              },
+              "latencyBudgetMs": {
+                "type": "number"
+              },
+              "relevanceFollowupWindowMs": {
+                "type": "number"
+              }
             }
           }
         }
@@ -221,10 +358,20 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "autoApplyEnabled": { "type": "boolean" },
+          "autoApplyEnabled": {
+            "type": "boolean"
+          },
           "scopes": {
             "type": "object",
-            "additionalProperties": { "type": "string", "enum": ["auto", "review", "manual", "off"] }
+            "additionalProperties": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "review",
+                "manual",
+                "off"
+              ]
+            }
           }
         }
       },
@@ -232,10 +379,18 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "host": { "type": "string" },
-          "port": { "type": "number" },
-          "tokenEnv": { "type": "string" }
+          "enabled": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "number"
+          },
+          "tokenEnv": {
+            "type": "string"
+          }
         }
       },
       "gitWatchers": {
@@ -243,23 +398,45 @@
         "items": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["id", "path"],
+          "required": [
+            "id",
+            "path"
+          ],
           "properties": {
-            "id": { "type": "string" },
-            "path": { "type": "string" },
-            "branch": { "type": "string" },
-            "remote": { "type": "string" },
-            "intervalMs": { "type": "number", "minimum": 60000 },
-            "source": { "type": "string" },
+            "id": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "branch": {
+              "type": "string"
+            },
+            "remote": {
+              "type": "string"
+            },
+            "intervalMs": {
+              "type": "number",
+              "minimum": 60000
+            },
+            "source": {
+              "type": "string"
+            },
             "anchors": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "cwd": { "type": "string" },
-                "branch": { "type": "string" }
+                "cwd": {
+                  "type": "string"
+                },
+                "branch": {
+                  "type": "string"
+                }
               }
             },
-            "gitBinary": { "type": "string" }
+            "gitBinary": {
+              "type": "string"
+            }
           }
         }
       },
@@ -268,23 +445,54 @@
         "items": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["id", "dir"],
+          "required": [
+            "id",
+            "dir"
+          ],
           "properties": {
-            "id": { "type": "string" },
-            "agentId": { "type": "string", "description": "Owning agent id; chunks ingested by this watcher are tagged for hard memory namespace isolation. Default 'main'." },
-            "dir": { "type": "string" },
-            "intervalMs": { "type": "number", "minimum": 5000 },
-            "source": { "type": "string" },
-            "maxBytesPerTick": { "type": "number", "minimum": 1024 },
-            "firstRunBackfillBytes": { "type": "number", "minimum": 0 },
-            "defaultImportance": { "type": "number", "minimum": 0, "maximum": 1 },
-            "dropPureQuestions": { "type": "boolean" },
+            "id": {
+              "type": "string"
+            },
+            "agentId": {
+              "type": "string",
+              "description": "Owning agent id; chunks ingested by this watcher are tagged for hard memory namespace isolation. Default 'main'."
+            },
+            "dir": {
+              "type": "string"
+            },
+            "intervalMs": {
+              "type": "number",
+              "minimum": 5000
+            },
+            "source": {
+              "type": "string"
+            },
+            "maxBytesPerTick": {
+              "type": "number",
+              "minimum": 1024
+            },
+            "firstRunBackfillBytes": {
+              "type": "number",
+              "minimum": 0
+            },
+            "defaultImportance": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "dropPureQuestions": {
+              "type": "boolean"
+            },
             "anchors": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "cwd": { "type": "string" },
-                "branch": { "type": "string" }
+                "cwd": {
+                  "type": "string"
+                },
+                "branch": {
+                  "type": "string"
+                }
               }
             }
           }
@@ -296,21 +504,66 @@
         "items": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["id", "trajectoryDir", "baseUrl", "model"],
+          "required": [
+            "id",
+            "trajectoryDir",
+            "baseUrl",
+            "model"
+          ],
           "properties": {
-            "id": { "type": "string" },
-            "trajectoryDir": { "type": "string", "description": "Path to <agent>/sessions/ holding *.trajectory.jsonl" },
-            "baseUrl": { "type": "string", "description": "Challenger endpoint (OpenAI-compatible proxy or direct endpoint)" },
-            "model": { "type": "string", "description": "Challenger model id sent in the request body" },
-            "apiKeyEnv": { "type": "string" },
-            "intervalMs": { "type": "number", "minimum": 10000 },
-            "backfillWindowMs": { "type": "number", "minimum": 0 },
-            "maxOutputTokens": { "type": "number", "minimum": 32 },
-            "requestTimeoutMs": { "type": "number", "minimum": 5000 },
-            "minUserMessageChars": { "type": "number", "minimum": 0 }
+            "id": {
+              "type": "string"
+            },
+            "trajectoryDir": {
+              "type": "string",
+              "description": "Path to <agent>/sessions/ holding *.trajectory.jsonl"
+            },
+            "baseUrl": {
+              "type": "string",
+              "description": "Challenger endpoint (OpenAI-compatible proxy or direct endpoint)"
+            },
+            "model": {
+              "type": "string",
+              "description": "Challenger model id sent in the request body"
+            },
+            "apiKeyEnv": {
+              "type": "string"
+            },
+            "intervalMs": {
+              "type": "number",
+              "minimum": 10000
+            },
+            "backfillWindowMs": {
+              "type": "number",
+              "minimum": 0
+            },
+            "maxOutputTokens": {
+              "type": "number",
+              "minimum": 32
+            },
+            "requestTimeoutMs": {
+              "type": "number",
+              "minimum": 5000
+            },
+            "minUserMessageChars": {
+              "type": "number",
+              "minimum": 0
+            }
           }
         }
       }
     }
+  },
+  "contracts": {
+    "memoryEmbeddingProviders": [
+      "openai-compat"
+    ],
+    "tools": [
+      "memory_search",
+      "memory_store",
+      "dashboard",
+      "tuning",
+      "compactor"
+    ]
   }
 }
