@@ -191,6 +191,12 @@ async function handleIngest(
       branch: asStr(anchorsRaw["branch"]),
       pr: asStr(anchorsRaw["pr"]),
       file: asStr(anchorsRaw["file"]),
+      channel: asStr(anchorsRaw["channel"]),
+      chat_id: asStr(anchorsRaw["chat_id"]),
+      sender_id: asStr(anchorsRaw["sender_id"]),
+      sender_label: asStr(anchorsRaw["sender_label"]),
+      scope: asStr(anchorsRaw["scope"]),
+      visibility: asStr(anchorsRaw["visibility"]),
     },
     sidecarText: asStr(b["sidecarText"]),
   };
@@ -260,6 +266,10 @@ async function handleRecall(
       pr: asStr(anchorsRaw["pr"]),
       file: asStr(anchorsRaw["file"]),
       session: asStr(anchorsRaw["session"]),
+      channel: asStr(anchorsRaw["channel"]),
+      chat_id: asStr(anchorsRaw["chat_id"]),
+      sender_id: asStr(anchorsRaw["sender_id"]),
+      scope: asStr(anchorsRaw["scope"]),
     },
     timeBucket: asStr(b["timeBucket"]),
   };
