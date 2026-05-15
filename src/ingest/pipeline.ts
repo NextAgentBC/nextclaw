@@ -63,6 +63,12 @@ export type IngestInput = {
     branch: string;
     pr: string;
     file: string;
+    channel: string;
+    chat_id: string;
+    sender_id: string;
+    sender_label: string;
+    scope: string;
+    visibility: string;
   }>;
   /** Optional sidecar text (the agent's <mem>...</mem> block). */
   sidecarText?: string;
@@ -171,6 +177,12 @@ async function writeMultiKeyIndexes(
   if (input.anchors?.branch) {inserts.push(["anchor_branch", input.anchors.branch]);}
   if (input.anchors?.pr) {inserts.push(["anchor_pr", input.anchors.pr]);}
   if (input.anchors?.file) {inserts.push(["anchor_file", input.anchors.file]);}
+  if (input.anchors?.channel) {inserts.push(["anchor_channel", input.anchors.channel]);}
+  if (input.anchors?.chat_id) {inserts.push(["anchor_chat_id", input.anchors.chat_id]);}
+  if (input.anchors?.sender_id) {inserts.push(["anchor_sender_id", input.anchors.sender_id]);}
+  if (input.anchors?.sender_label) {inserts.push(["anchor_sender_label", input.anchors.sender_label]);}
+  if (input.anchors?.scope) {inserts.push(["anchor_scope", input.anchors.scope]);}
+  if (input.anchors?.visibility) {inserts.push(["anchor_visibility", input.anchors.visibility]);}
   for (const ev of result.events) {inserts.push(["event_type", ev.type]);}
   for (const m of result.metrics)  {inserts.push(["metric_name", m.metric]);}
   for (const p of result.preferences) {
