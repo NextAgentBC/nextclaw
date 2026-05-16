@@ -240,6 +240,11 @@ async function main() {
       const result = await ingestPdf(targetPath, sharedCtx);
       chunksWritten = result.chunksWritten;
       ingestErrors = result.errors;
+    } else if (ext === ".csv") {
+      const result = await ingestCsv(targetPath, sharedCtx);
+      chunksWritten = result.chunksWritten;
+      ingestErrors = result.errors;
+      console.log(`         (Q&A rows pre-seeded to cache.qa: ${result.cacheRowsSeeded})`);
     } else {
       ingestErrors.push(`parser for ${ext} not implemented yet`);
     }
@@ -277,8 +282,8 @@ async function main() {
 }
 
 function ingestEligibility(ext) {
-  const supported = new Set([".md", ".markdown", ".txt", ".pdf"]);
-  const pending = new Set([".docx", ".csv", ".html", ".htm"]);
+  const supported = new Set([".md", ".markdown", ".txt", ".pdf", ".csv"]);
+  const pending = new Set([".docx", ".html", ".htm"]);
   const storeOnly = new Set([".png", ".jpg", ".jpeg", ".heic", ".mp3", ".ogg", ".wav", ".m4a", ".mp4", ".mov"]);
   if (supported.has(ext)) {return { canIngest: true, parser: ext.replace(".", "") };}
   if (pending.has(ext)) {return { canIngest: false, reason: `${ext.slice(1)} parser not yet implemented` };}
@@ -326,6 +331,124 @@ async function ingestMarkdown(absPath, { docId, version, decision, hints, sender
     }
   }
   return { chunksWritten: ok, errors };
+}
+
+/* ---------------------------------- csv ----------------------------------- */
+/**
+ * CSV ingest with auto-detection of Q&A columns.
+ *
+ * If the CSV header contains a column matching /question|问|q/i AND another
+ * matching /answer|答|a/i, the file is treated as a Q&A pre-seed:
+ *   - Each row's `answer` is ingested as a knowledge chunk (with `question`
+ *     prepended as the heading).
+ *   - The (question, answer) pair is ALSO posted to /api/cache/store so
+ *     `cache.qa` is primed — the most common student/customer Qs answer in
+ *     ~50ms with 0 LLM tokens from the very first ask, no warm-up needed.
+ *
+ * If the CSV is a generic table (no Q&A columns), each row becomes a chunk
+ * formatted as `<col1>: <val1> / <col2>: <val2> / ...`.
+ *
+ * Topic per row: an optional `topic` / `category` column wins, else falls
+ * back to the doc-level topic from caption hints.
+ */
+async function ingestCsv(absPath, ctx) {
+  const { docId, version, decision, hints, senderUserId, chatId, ownerId } = ctx;
+  const { parse } = await import("csv-parse/sync");
+  const raw = await readFile(absPath, "utf8");
+  let rows;
+  try {
+    rows = parse(raw, {
+      columns: true,
+      skip_empty_lines: true,
+      relax_column_count: true,
+      trim: true,
+    });
+  } catch (err) {
+    return { chunksWritten: 0, cacheRowsSeeded: 0, errors: [`csv-parse failed: ${err.message}`] };
+  }
+  if (rows.length === 0) {
+    return { chunksWritten: 0, cacheRowsSeeded: 0, errors: ["csv has zero data rows"] };
+  }
+  const headers = Object.keys(rows[0]);
+  const qCol = headers.find((h) => /^(question|q|问题?|提问)$/i.test(h));
+  const aCol = headers.find((h) => /^(answer|a|答案?|回答)$/i.test(h));
+  const topicCol = headers.find((h) => /^(topic|category|话题|分类)$/i.test(h));
+
+  const anchors = buildAnchors(ctx);
+  let chunksWritten = 0;
+  let cacheRowsSeeded = 0;
+  const errors = [];
+
+  for (const [idx, row] of rows.entries()) {
+    const rowTopic = (topicCol && row[topicCol]) || hints.topic || null;
+
+    // Build text for ingest chunk.
+    let text;
+    let sourceRef;
+    if (qCol && aCol) {
+      const q = String(row[qCol] ?? "").trim();
+      const a = String(row[aCol] ?? "").trim();
+      if (!q || !a) {continue;}
+      text = `Q: ${q}\nA: ${a}`;
+      sourceRef = `${docId}:v${version}:row:${idx + 1}`;
+
+      // Pre-seed cache.qa
+      try {
+        const cacheR = await fetch(`${apiBase}/api/cache/store`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-token": dashToken },
+          body: JSON.stringify({
+            agentId: "main",
+            question: q,
+            answer: a,
+            answerFormat: "plain",
+            scope: {
+              chatId: anchors.chat_id,
+              senderId: anchors.sender_id,
+              visibility: anchors.visibility ?? "public",
+            },
+            topicTag: rowTopic,
+            source: "csv-seed",
+            sourceDocId: docId,
+            ttlDays: 365, // CSV-seeded entries are curated; longer TTL
+          }),
+        });
+        if (cacheR.ok) {cacheRowsSeeded += 1;}
+      } catch (err) {
+        errors.push(`row:${idx + 1} cache-seed: ${err.message}`);
+      }
+    } else {
+      // Generic row — flatten as "col: val | col: val" for ingest.
+      const parts = headers.filter((h) => row[h]).map((h) => `${h}: ${row[h]}`);
+      text = parts.join(" | ");
+      sourceRef = `${docId}:v${version}:row:${idx + 1}`;
+      if (text.length < 80) {continue;}
+    }
+
+    try {
+      const r = await fetch(`${apiBase}/api/ingest`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-token": dashToken },
+        body: JSON.stringify({
+          text,
+          source: `kb:${docId}`,
+          sourceRef,
+          kind: "knowledge",
+          agentId: "main",
+          importance: 0.7,
+          retentionClass: "pinned",
+          anchors: { ...anchors, ...(rowTopic ? { scope: rowTopic } : {}) },
+        }),
+      });
+      if (!r.ok) {throw new Error(`HTTP ${r.status}`);}
+      const j = await r.json();
+      if (j?.outcome?.decision === "accepted" || j?.outcome?.decision === "merged") {chunksWritten += 1;}
+    } catch (err) {
+      errors.push(`row:${idx + 1} ingest: ${err.message}`);
+    }
+  }
+
+  return { chunksWritten, cacheRowsSeeded, errors };
 }
 
 /* ---------------------------------- pdf ----------------------------------- */
