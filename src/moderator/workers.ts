@@ -58,14 +58,24 @@ export type RoleSpec = {
  * Minimal default role used when no DB row matches the Moderator's
  * `roleKey`. Keep the prompt short — domain logic belongs in DB rows.
  */
+/**
+ * "Swiss Army worker" — out-of-the-box tools so the worker isn't useless
+ * when the Moderator falls back to it. Specialized roles can override by
+ * passing a narrower `tools` list at registration time.
+ *
+ * Empty `tools` on a stored role row → INHERITS these defaults (see
+ * loadRoleSpec). To get a genuinely tool-less role, register with
+ * `tools=['__none__']` — resolveTools() filters unknowns to [].
+ */
 const DEFAULT_ROLE: RoleSpec = {
   roleKey: "default",
   displayName: "默认助手",
   systemPrompt:
     "你是一个 Telegram 群里的助教 / 客服助手。用中文简洁回答用户的问题。" +
-    "如果给了你 '相关记忆' 段落，引用其中确凿的信息；否则按通识回答，但要诚实说明不确定。" +
+    "你有两个工具：memory_search（查历史记忆 / 缓存的问答）、web_search（查实时网络信息）。" +
+    "问到最新事件、新闻、当前状态时优先用 web_search；问到本群历史或已有共识时优先 memory_search。" +
     "不要复述问题，不要加 emoji，不要套话开场。3 段以内。",
-  tools: [],
+  tools: ["memory_search", "web_search"],
   memoryScope: {},
   model: "gemini:gemini-2.5-flash",
 };
@@ -163,11 +173,16 @@ export async function loadRoleSpec(
   if (!row) {
     return { ...DEFAULT_ROLE, roleKey }; // keep the requested key for traceability
   }
+  // "tools=[]" means "inherit DEFAULT tools" — most stored role rows
+  // pre-date the tool runtime. Roles wanting strictly zero tools should
+  // register with ['__none__'] which the registry filters back to [].
+  const storedTools = row.tools ?? [];
+  const effectiveTools = storedTools.length === 0 ? [...DEFAULT_ROLE.tools] : storedTools;
   return {
     roleKey: row.role_key,
     displayName: row.display_name ?? row.role_key,
     systemPrompt: row.system_prompt,
-    tools: row.tools ?? [],
+    tools: effectiveTools,
     memoryScope: (row.memory_scope ?? {}) as { topic?: string; kind?: string },
     model: row.model,
   };
