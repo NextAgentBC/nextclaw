@@ -290,7 +290,13 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
 /* ----------------------------- small helpers ------------------------------ */
 
 function stripChannelPrefix(value: string): string {
-  return value.replace(/^(?:channel:|chat:|user:|tg-?)/, "");
+  // openclaw conversation/sender ids arrive prefixed in a few ways depending
+  // on the channel: `channel:<id>`, `chat:<id>`, `user:<id>`, `tg-<id>`,
+  // or the channel name itself like `telegram:<id>` / `slack:<id>` etc.
+  // Strip whichever prefix we find. Telegram group ids are negative so
+  // after stripping we want a clean `-100...` so the downstream chat-type
+  // inferrer works.
+  return value.replace(/^(?:channel:|chat:|user:|tg-?|telegram:|slack:|discord:|whatsapp:)/, "");
 }
 
 function inferChatTypeFromId(rawChatId: string): "private" | "group" | "supergroup" {

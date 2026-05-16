@@ -61,7 +61,7 @@ export async function saveModeratorState(
        paused_by, paused_reason,
        updated_at
      )
-     VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, now())
+     VALUES ($1, $2, $3::jsonb, COALESCE($4, 'live'), $5, $6, $7, $8, $9, $10, now())
      ON CONFLICT (agent_id, scope_key) DO UPDATE
        SET state           = EXCLUDED.state,
            status          = COALESCE($4, moderator.state.status),

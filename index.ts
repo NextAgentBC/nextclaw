@@ -39,6 +39,16 @@ import {
 } from "./src/workers/reflection.js";
 import { buildModeratorLlm } from "./src/moderator/llm-client.js";
 import { startModeratorService, type ModeratorServiceHandle } from "./src/moderator/service.js";
+
+/**
+ * Module-level handle for the moderator service. `api.on(...)` hook
+ * handlers and the registerService start() callback may be invoked in
+ * DIFFERENT register(api) closures (cli-metadata pass / tool-discovery
+ * pass / real runtime pass), so the closure-captured variable approach
+ * doesn't reliably let the hook see the handle the service installs.
+ * Module-level state side-steps that.
+ */
+let MODULE_MODERATOR_HANDLE: ModeratorServiceHandle | null = null;
 import { startTranscriptWatcherDaemon, type TranscriptWatcherHandle } from "./src/workers/transcript-watcher.js";
 import { startShadowComparator } from "./src/workers/shadow-comparator.js";
 import { evaluateGuards, runDailyAnalyzer } from "./src/workers/tuning.js";
@@ -110,11 +120,18 @@ export default definePluginEntry({
     // (it needs pg pool + llm client + telegram token which only become
     // available after start(ctx) fires). The hook captures the handle
     // by closure and no-ops until start() completes.
-    let activeModeratorHandle: ModeratorServiceHandle | null = null;
     api.on("message_received", async (event, hookCtx) => {
-      if (!activeModeratorHandle) {return;}
+      const ctxObj = hookCtx as { channelId?: string; conversationId?: string; senderId?: string };
+      // TEMP debug — verify the hook is firing at all (next commit will
+      // demote this to debug level after we've confirmed the wiring).
+      api.logger.info(
+        `[moderator/hook] message_received fired: channel=${ctxObj?.channelId} ` +
+          `conv=${ctxObj?.conversationId} sender=${ctxObj?.senderId} ` +
+          `handle=${MODULE_MODERATOR_HANDLE ? "bound" : "unbound"}`,
+      );
+      if (!MODULE_MODERATOR_HANDLE) {return;}
       try {
-        activeModeratorHandle.onMessageReceived(
+        MODULE_MODERATOR_HANDLE.onMessageReceived(
           event as Parameters<ModeratorServiceHandle["onMessageReceived"]>[0],
           hookCtx as Parameters<ModeratorServiceHandle["onMessageReceived"]>[1],
         );
@@ -401,9 +418,10 @@ export default definePluginEntry({
                 logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
                 debounceMs: cfg.moderator.debounceMs,
               });
-              // Bind the closure variable so the top-level api.on hook
-              // starts forwarding events from now on.
-              activeModeratorHandle = moderatorHandle;
+              // Publish to module-level state so the top-level api.on
+              // hook (which may live in a DIFFERENT register() closure)
+              // can forward events to us.
+              MODULE_MODERATOR_HANDLE = moderatorHandle;
               api.logger.info(
                 `memory-postgres: moderator service started — model=${cfg.moderator.model.format}:${cfg.moderator.model.model} ` +
                   `debounceMs=${cfg.moderator.debounceMs} owner=${ownerUserId ?? "(none)"}`,
@@ -453,7 +471,7 @@ export default definePluginEntry({
           try { moderatorHandle.stop(); } catch { /* ignore */ }
           moderatorHandle = null;
         }
-        activeModeratorHandle = null;
+        MODULE_MODERATOR_HANDLE = null;
         if (moderatorEventUnsub) {
           try { moderatorEventUnsub(); } catch { /* ignore */ }
           moderatorEventUnsub = null;
