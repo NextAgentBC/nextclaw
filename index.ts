@@ -37,6 +37,8 @@ import {
   startReflectionDaemon,
   type ReflectionDaemonHandle,
 } from "./src/workers/reflection.js";
+import { buildModeratorLlm } from "./src/moderator/llm-client.js";
+import { startModeratorService, type ModeratorServiceHandle } from "./src/moderator/service.js";
 import { startTranscriptWatcherDaemon, type TranscriptWatcherHandle } from "./src/workers/transcript-watcher.js";
 import { startShadowComparator } from "./src/workers/shadow-comparator.js";
 import { evaluateGuards, runDailyAnalyzer } from "./src/workers/tuning.js";
@@ -116,6 +118,8 @@ export default definePluginEntry({
     let transcriptWatcherHandles: TranscriptWatcherHandle[] = [];
     let shadowHandles: Array<{ stop: () => void }> = [];
     let reflectionHandle: ReflectionDaemonHandle | null = null;
+    let moderatorHandle: ModeratorServiceHandle | null = null;
+    let moderatorEventUnsub: (() => void) | null = null;
     let activePoolCfg: ResolvedPoolConfig | null = null;
 
     api.registerService({
@@ -332,6 +336,77 @@ export default definePluginEntry({
           );
         }
 
+        // Moderator service (Phase C) — hooks Telegram message_received and
+        // runs the orchestrator-worker decision loop per (chat, user) with
+        // 1.5s debounce. Off by default; opt in via config.moderator.enabled.
+        if (cfg.moderator.enabled && cfg.moderator.model.baseUrl) {
+          try {
+            const pool = await getPool(activePoolCfg);
+            const llm = buildModeratorLlm({
+              format: cfg.moderator.model.format,
+              baseUrl: cfg.moderator.model.baseUrl,
+              model: cfg.moderator.model.model,
+              apiKeyEnv: cfg.moderator.model.apiKeyEnv,
+            });
+            // Pull live config for telegram token + ownerAllowFrom.
+            const live = ctx.config as unknown as {
+              channels?: { telegram?: { botToken?: string } };
+              commands?: { ownerAllowFrom?: string[] };
+              gateway?: { auth?: { token?: string } };
+            };
+            const botToken = live.channels?.telegram?.botToken ?? "";
+            const ownerEntry = (live.commands?.ownerAllowFrom ?? [])
+              .find((s) => typeof s === "string" && s.startsWith("telegram:"));
+            const ownerUserId = ownerEntry ? ownerEntry.replace(/^telegram:/, "") : undefined;
+            const dashTokenEnv = cfg.dashboard.tokenEnv;
+            const ingestToken = dashTokenEnv ? (process.env[dashTokenEnv] ?? "") : "";
+
+            if (!botToken) {
+              api.logger.warn(
+                "memory-postgres: moderator.enabled=true but channels.telegram.botToken empty — service NOT started.",
+              );
+            } else if (!ingestToken) {
+              api.logger.warn(
+                "memory-postgres: moderator.enabled=true but dashboard.tokenEnv unresolved — service NOT started (memory-writes would fail).",
+              );
+            } else {
+              moderatorHandle = startModeratorService({
+                enabled: true,
+                llm,
+                telegramBotToken: botToken,
+                ownerUserId,
+                ingestUrl: `http://${cfg.dashboard.host}:${cfg.dashboard.port}/api/ingest`,
+                ingestToken,
+                cfg,
+                pool,
+                logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
+                debounceMs: cfg.moderator.debounceMs,
+              });
+              // Hook openclaw's telegram message_received event.
+              // Same surface thread-ownership uses; per-channel id check
+              // filters non-telegram channels inside the handler.
+              api.on("message_received", async (event: unknown, hookCtx: unknown) => {
+                moderatorHandle?.onMessageReceived(
+                  event as Parameters<NonNullable<typeof moderatorHandle>["onMessageReceived"]>[0],
+                  hookCtx as Parameters<NonNullable<typeof moderatorHandle>["onMessageReceived"]>[1],
+                );
+              });
+              api.logger.info(
+                `memory-postgres: moderator service started — model=${cfg.moderator.model.format}:${cfg.moderator.model.model} ` +
+                  `debounceMs=${cfg.moderator.debounceMs} owner=${ownerUserId ?? "(none)"}`,
+              );
+            }
+          } catch (err) {
+            api.logger.warn(
+              `memory-postgres: moderator service failed to start: ${(err as Error).message}`,
+            );
+          }
+        } else if (cfg.moderator.enabled) {
+          api.logger.warn(
+            "memory-postgres: moderator.enabled=true but model.baseUrl is empty — service NOT started.",
+          );
+        }
+
         // Shadow comparators — for every gpt-5.5 turn we observe in the
         // trajectory, replay the same prompt against a challenger model
         // (qwen3.6-35B by default) and store both sides side-by-side. Lets
@@ -360,6 +435,14 @@ export default definePluginEntry({
         if (reflectionHandle) {
           try { reflectionHandle.stop(); } catch { /* ignore */ }
           reflectionHandle = null;
+        }
+        if (moderatorHandle) {
+          try { moderatorHandle.stop(); } catch { /* ignore */ }
+          moderatorHandle = null;
+        }
+        if (moderatorEventUnsub) {
+          try { moderatorEventUnsub(); } catch { /* ignore */ }
+          moderatorEventUnsub = null;
         }
         tuningTimer = null;
         compactorTimer = null;

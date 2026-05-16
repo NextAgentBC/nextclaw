@@ -555,6 +555,31 @@
           }
         }
       },
+      "moderator": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Phase C orchestrator-worker Moderator. When enabled, hooks Telegram message_received events for groups + DMs (DMs continue through the existing per-DM agent path; groups get routed via the Moderator). Off by default.",
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "debounceMs": {
+            "type": "number",
+            "minimum": 100,
+            "default": 1500,
+            "description": "Per (scope,user) burst window — multiple messages within this window coalesce into one decision."
+          },
+          "model": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["format", "baseUrl"],
+            "properties": {
+              "format": { "type": "string", "enum": ["openai", "gemini"] },
+              "baseUrl": { "type": "string" },
+              "model": { "type": "string" },
+              "apiKeyEnv": { "type": "string" }
+            }
+          }
+        }
+      },
       "reflection": {
         "type": "object",
         "additionalProperties": false,
