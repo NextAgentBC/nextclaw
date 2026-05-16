@@ -396,7 +396,8 @@ export default definePluginEntry({
 
     api.logger.info(
       "memory-postgres: capability + tools registered "
-        + "(memory_search, memory_store, dashboard, tuning, compactor)",
+        + "(memory_search, memory_store, memory_update, memory_forget; "
+        + "services: dashboard, tuning, compactor, reflection)",
     );
   },
 });

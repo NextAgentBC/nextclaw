@@ -45,13 +45,23 @@ export type RecallContext = {
    * are merged.
    */
   timeBuckets?: string[];
-  /** Pre-resolved anchor values (cwd, branch, pr_number, file_path, session_id). */
+  /**
+   * Pre-resolved anchor values. The five core anchors (cwd / branch / pr /
+   * file / session) are what `routeAnchor` actually filters on; the others
+   * (channel / chat_id / sender_id / scope) flow through from the dashboard
+   * HTTP gateway so chat-channel-aware ingestors can pass context that
+   * other workers will pick up. Index-side ignores unknown anchor kinds.
+   */
   anchors?: {
     cwd?: string;
     branch?: string;
     pr?: string;
     file?: string;
     session?: string;
+    channel?: string;
+    chat_id?: string;
+    sender_id?: string;
+    scope?: string;
   };
   /** Entity ids previously resolved from query mentions. */
   entityIds?: string[];
