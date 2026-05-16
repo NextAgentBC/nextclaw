@@ -66,15 +66,23 @@ export type RoleSpec = {
  * Empty `tools` on a stored role row → INHERITS these defaults (see
  * loadRoleSpec). To get a genuinely tool-less role, register with
  * `tools=['__none__']` — resolveTools() filters unknowns to [].
+ *
+ * The systemPrompt here is intentionally MINIMAL — almost no formatting
+ * rules. The user feedback "还是非常死板，不自由，限制了" came from a
+ * verbose DEFAULT_ROLE prompt that mandated "3 段以内 / 简洁 / 不加
+ * emoji". Each rule trims the model's degrees of freedom — the
+ * cumulative effect is a corporate-sounding bullet-list robot. Letting
+ * the model choose length and format from context produces more natural
+ * answers. The baseline preamble (below) covers the essential
+ * guarantees (language match, tool use); everything else is left to
+ * the model's judgment.
  */
 const DEFAULT_ROLE: RoleSpec = {
   roleKey: "default",
   displayName: "默认助手",
   systemPrompt:
-    "你是一个 Telegram 群里的助教 / 客服助手。用中文简洁回答用户的问题。" +
-    "你有两个工具：memory_search（查历史记忆 / 缓存的问答）、web_search（查实时网络信息）。" +
-    "问到最新事件、新闻、当前状态时优先用 web_search；问到本群历史或已有共识时优先 memory_search。" +
-    "不要复述问题，不要加 emoji，不要套话开场。3 段以内。",
+    "你是一个能上网搜索、能回忆群里历史的助手。像跟朋友聊天那样自然地回答——长短、" +
+    "口吻、要不要列点都看问题本身决定，不用套格式。",
   tools: ["memory_search", "web_search"],
   memoryScope: {},
   model: "gemini:gemini-2.5-flash",
@@ -219,7 +227,13 @@ export type WorkerResult = {
 
 const MAX_RECALL_CHUNKS = 5;
 const MAX_CHUNK_CHARS = 400;
-const WORKER_MAX_OUTPUT_TOKENS = 800;
+// Loosened from 800 → 1500 so the model can stretch when a question
+// warrants depth; the preamble tells it to be concise when not warranted.
+const WORKER_MAX_OUTPUT_TOKENS = 1500;
+// Loosened from 0.4 → 0.7 — at 0.4 the model fell into a corporate
+// bullet-list rut. 0.7 gets more natural prose without veering into
+// unreliable territory.
+const WORKER_TEMPERATURE = 0.7;
 
 /**
  * Strips Telegram @-mentions and collapses whitespace so the cache key
@@ -300,11 +314,26 @@ export async function dispatchWorker(
   }
 
   // --- Build prompt ---
+  // Include BOTH the user's verbatim message (preserves tone, slang,
+  // language register) AND the Moderator's formal taskPrompt (if it
+  // differs). Without the verbatim version the Moderator's typical
+  // rewrite ("Please research and summarize...") makes the worker
+  // answer in formal English-summary style even when the user wrote
+  // a casual Chinese one-liner.
   const userPromptParts: string[] = [];
   if (recallText) {
     userPromptParts.push(`## 相关记忆\n${recallText}`);
   }
-  userPromptParts.push(`## 用户问题\n${task.taskPrompt || cleanedQ}`);
+  userPromptParts.push(`## 用户原话\n${cleanedQ}`);
+  // Only include the Moderator's reframing if it actually says something
+  // different (avoid duplication when Moderator just passes the user's
+  // text through as taskPrompt).
+  const taskRewrite = (task.taskPrompt ?? "").trim();
+  if (taskRewrite && taskRewrite !== cleanedQ) {
+    userPromptParts.push(
+      `## Moderator 的任务说明（供参考，回答时按用户原话的口吻和语言）\n${taskRewrite}`,
+    );
+  }
   const userPrompt = userPromptParts.join("\n\n");
 
   // --- LLM call ---
@@ -312,22 +341,20 @@ export async function dispatchWorker(
   //   - No tools allowlisted → single-shot (current behavior, zero regression)
   //   - Tools available     → one round of tool-call → execute → final answer
   const tools = resolveTools(role.tools);
-  // Every role gets this baseline guidance prepended to its systemPrompt.
-  // The role's own prompt drives persona / voice / scope — this just
-  // ensures every worker, regardless of who designed the role, knows to:
-  //   1. match the user's language (the Moderator sometimes coins roles
-  //      with English systemPrompts → workers replied in English to
-  //      Chinese users)
-  //   2. use web_search for current/time-sensitive info (a sloppy
-  //      Moderator-coined role might forget to mention this)
-  //   3. use memory_search for prior-conversation references
-  // ~70 tokens overhead per worker call — cheap compared to a wrong answer.
+  // Minimal baseline guarantees prepended to every role's systemPrompt:
+  //   - language match (Moderator-coined roles sometimes have English
+  //     systemPrompts → English replies to Chinese users)
+  //   - permit tool use (a sloppy role prompt sometimes makes the model
+  //     claim "I can't browse"; the floor tools are always present so
+  //     this nudge unlocks them)
+  //   - explicit anti-formality (the model's default mode on Gemini is
+  //     bullet-list-with-bold-headers; users on this deployment said it
+  //     felt 死板; let it write prose unless the question is literally
+  //     a list)
+  // The role's own prompt still drives persona / scope / topic focus.
   const WORKER_BASELINE_PREAMBLE =
-    "回答时遵守以下基线规则：\n" +
-    "1) 用用户提问使用的语言回答（中文问题用中文，英文问题用英文）。\n" +
-    "2) 问到实时/最新信息（新闻、版本号、当前状态、最近更新）时主动用 web_search 工具，别说『我无法上网』。\n" +
-    "3) 问到本群历史或已建立的事实时用 memory_search。\n\n" +
-    "---\n\n";
+    "用用户的语言回答；需要实时信息就调 web_search，需要群里历史就调 memory_search。" +
+    "口吻自然，能用整段话说清的就别堆 ** 加粗标题和项目符号。\n\n---\n\n";
   const effectiveSystemPrompt = WORKER_BASELINE_PREAMBLE + role.systemPrompt;
   const totals = { inputTokens: 0, outputTokens: 0, model: undefined as string | undefined };
   const startLatency = Date.now();
@@ -351,7 +378,7 @@ export async function dispatchWorker(
     history: [{ role: "user", text: userPrompt }],
     tools,
     maxOutputTokens: WORKER_MAX_OUTPUT_TOKENS,
-    temperature: 0.4,
+    temperature: WORKER_TEMPERATURE,
   });
   if (!turn1.ok) {
     return failureResult(task, role, cleanedQ, topicTag, recallCount, turn1.error);
@@ -392,7 +419,7 @@ export async function dispatchWorker(
     ],
     tools, // still present in case model wants to refuse another call cleanly
     maxOutputTokens: WORKER_MAX_OUTPUT_TOKENS,
-    temperature: 0.4,
+    temperature: WORKER_TEMPERATURE,
   });
   if (!turn2.ok) {
     return failureResult(task, role, cleanedQ, topicTag, recallCount, turn2.error);
