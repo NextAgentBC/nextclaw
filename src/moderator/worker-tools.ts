@@ -43,6 +43,10 @@ export type ToolRuntimeDeps = {
   cfg: ResolvedMemoryPostgresConfig;
   agentId: string;
   viewer: ViewerScope | undefined;
+  /** Optional override for the Tavily endpoint. When omitted the
+   *  executor falls back to env-var resolution. Service.ts passes
+   *  `cfg.credbroker.tavilyUrl` here so the runtime URL is config-driven. */
+  webSearchUrl?: string | null;
 };
 
 /* ------------------------------- definitions ------------------------------ */
@@ -133,7 +137,7 @@ export async function executeTool(
     return execMemorySearch(deps, call.args);
   }
   if (call.name === "web_search") {
-    return execWebSearch(call.args);
+    return execWebSearch(call.args, deps.webSearchUrl ?? null);
   }
   return {
     name: call.name,
@@ -206,14 +210,15 @@ const WEB_SEARCH_SNIPPET_CHARS = 400;
 
 /**
  * Resolve the Tavily endpoint:
- *   1. If `NEXTCLAW_WEB_SEARCH_URL` env is set, use it (full URL).
- *   2. Else if `TAVILY_API_KEY` env is set, hit api.tavily.com directly.
- *   3. Else default to the credbroker proxy URL (Tailscale-only, no key needed).
- *
- * Order matters: explicit env override > direct API > broker default. The
- * broker fallback lets the existing Oracle box keep working unchanged.
+ *   1. Explicit `webSearchUrl` from ToolRuntimeDeps (set by service.ts
+ *      from `cfg.credbroker.tavilyUrl`) — preferred path.
+ *   2. `NEXTCLAW_WEB_SEARCH_URL` env override.
+ *   3. `TAVILY_API_KEY` env → direct api.tavily.com.
+ *   4. Hard-coded fallback (kept so an ill-configured deployment still
+ *      tries something; logged as a soft warning the operator should fix).
  */
-function resolveWebSearchEndpoint(): { url: string; apiKey?: string } {
+function resolveWebSearchEndpoint(fromDeps: string | null): { url: string; apiKey?: string } {
+  if (fromDeps) {return { url: fromDeps, apiKey: process.env.TAVILY_API_KEY };}
   const explicit = process.env.NEXTCLAW_WEB_SEARCH_URL;
   if (explicit) {
     return { url: explicit, apiKey: process.env.TAVILY_API_KEY };
@@ -222,10 +227,15 @@ function resolveWebSearchEndpoint(): { url: string; apiKey?: string } {
   if (directKey) {
     return { url: "https://api.tavily.com/search", apiKey: directKey };
   }
+  // Last-resort placeholder. Real deployments should set credbroker or
+  // TAVILY_API_KEY; this URL is just so the call doesn't crash silently.
   return { url: "http://100.79.97.110:8800/v1/proxy/tavily/search" };
 }
 
-async function execWebSearch(args: Record<string, unknown>): Promise<ToolResult> {
+async function execWebSearch(
+  args: Record<string, unknown>,
+  webSearchUrl: string | null,
+): Promise<ToolResult> {
   const query = typeof args.query === "string" ? args.query.trim() : "";
   if (query.length < 2) {
     return {
@@ -235,7 +245,7 @@ async function execWebSearch(args: Record<string, unknown>): Promise<ToolResult>
   }
   const maxRaw = typeof args.max === "number" ? args.max : WEB_SEARCH_DEFAULT;
   const max = Math.min(WEB_SEARCH_MAX, Math.max(1, Math.floor(maxRaw)));
-  const { url, apiKey } = resolveWebSearchEndpoint();
+  const { url, apiKey } = resolveWebSearchEndpoint(webSearchUrl);
   const body: Record<string, unknown> = { query, max_results: max };
   if (apiKey) {body.api_key = apiKey;}
   const ctrl = new AbortController();

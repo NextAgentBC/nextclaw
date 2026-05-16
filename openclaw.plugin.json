@@ -94,6 +94,27 @@
           }
         }
       },
+      "credbroker": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Tailscale-authenticated API proxy (per-deployment). When set, any embedding / moderator / reflection / web_search endpoint that omits its explicit baseUrl auto-derives as `${baseUrl}/v1/proxy/${services.<name>}`. Explicit per-service URLs always win — credbroker only fills gaps.",
+        "properties": {
+          "baseUrl": {
+            "type": "string",
+            "description": "Proxy base, e.g. `http://100.79.97.110:8800`. No trailing slash."
+          },
+          "services": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Per-service path tails. Defaults match the common credbroker setup.",
+            "properties": {
+              "embedding": { "type": "string", "description": "Default 'local-embed'" },
+              "gemini":    { "type": "string", "description": "Default 'gemini'" },
+              "tavily":    { "type": "string", "description": "Default 'tavily' (worker tool web_search appends /search)" }
+            }
+          }
+        }
+      },
       "embedding": {
         "type": "object",
         "additionalProperties": false,
@@ -573,7 +594,7 @@
           "model": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["format", "baseUrl"],
+            "required": ["format"],
             "properties": {
               "format": { "type": "string", "enum": ["openai", "gemini"] },
               "baseUrl": { "type": "string" },
@@ -610,7 +631,7 @@
           "model": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["format", "baseUrl"],
+            "required": ["format"],
             "properties": {
               "format": {
                 "type": "string",
