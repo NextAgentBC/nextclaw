@@ -13,6 +13,27 @@ export type MemoryPostgresConfig = {
     statementTimeoutMs?: number;
   };
   /**
+   * Optional credbroker (Tailscale-authenticated API proxy) block. When set,
+   * any per-service `baseUrl` that is omitted gets auto-derived as
+   * `${credbroker.baseUrl}/v1/proxy/${credbroker.services.<name>}`. Explicit
+   * per-service URLs always win — credbroker only fills gaps. Same proxy
+   * also services the `web_search` worker tool (Tavily).
+   *
+   * Purpose: collapse the 5+ identical `http://<host>:<port>/v1/proxy/...`
+   * URLs scattered across embedding / moderator / reflection into one place,
+   * so flipping environments is a one-line change.
+   */
+  credbroker?: {
+    /** Base URL of the proxy, e.g. `http://100.79.97.110:8800`. No trailing slash. */
+    baseUrl?: string;
+    /** Per-service path tail used for `${baseUrl}/v1/proxy/${service}`. */
+    services?: {
+      embedding?: string; // default 'local-embed'
+      gemini?: string;    // default 'gemini'
+      tavily?: string;    // default 'tavily'
+    };
+  };
+  /**
    * Embedding endpoint block. Optional — when omitted, defaults to Jina's
    * free tier (`format=jina`, `model=jina-embeddings-v3`, baseUrl
    * `https://api.jina.ai`, apiKeyEnv `JINA_API_KEY`). New users only need
@@ -246,8 +267,18 @@ export type GitWatcherConfig = {
   gitBinary?: string;
 };
 
+export type ResolvedCredbrokerConfig = {
+  /** Fully-resolved base URL with no trailing slash, or `null` if not configured. */
+  baseUrl: string | null;
+  /** Pre-built per-service URLs (or `null` when credbroker is disabled). */
+  embeddingUrl: string | null;
+  geminiUrl: string | null;
+  tavilyUrl: string | null;
+};
+
 export type ResolvedMemoryPostgresConfig = {
   postgres: { url: string; poolMax: number; statementTimeoutMs: number };
+  credbroker: ResolvedCredbrokerConfig;
   embedding: {
     provider: string;
     model: string;
@@ -387,6 +418,7 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
   const recallScoring = scoring.recall ?? {};
   const dashboard = raw.dashboard ?? {};
   const tuning = raw.tuning ?? {};
+  const credbroker = resolveCredbroker(raw.credbroker);
 
   return {
     postgres: {
@@ -394,7 +426,8 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
       poolMax: num(raw.postgres.poolMax, 8),
       statementTimeoutMs: num(raw.postgres.statementTimeoutMs, 30_000),
     },
-    embedding: resolveEmbeddingConfig(raw.embedding),
+    credbroker,
+    embedding: resolveEmbeddingConfig(raw.embedding, credbroker),
     tiers: {
       t0SizeLimit: num(tiers.t0SizeLimit, 50),
       t1SizeLimit: num(tiers.t1SizeLimit, 500),
@@ -436,21 +469,52 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
     gitWatchers: (raw.gitWatchers ?? []).map(resolveGitWatcher),
     transcriptWatchers: (raw.transcriptWatchers ?? []).map(resolveTranscriptWatcher),
     shadowComparators: (raw.shadowComparators ?? []).map(resolveShadowComparator),
-    reflection: resolveReflectionConfig(raw.reflection),
-    moderator: resolveModeratorConfig(raw.moderator),
+    reflection: resolveReflectionConfig(raw.reflection, credbroker),
+    moderator: resolveModeratorConfig(raw.moderator, credbroker),
   };
 }
 
-function resolveModeratorConfig(raw: ModeratorConfig | undefined): ResolvedModeratorConfig {
+/**
+ * Build a `ResolvedCredbrokerConfig` from the raw block. If `baseUrl` is
+ * missing the whole struct disables (all fields `null`), which means
+ * per-service URLs MUST be set explicitly elsewhere. The service tail
+ * defaults match Yao's setup but are overridable for other deployments.
+ */
+function resolveCredbroker(raw: MemoryPostgresConfig["credbroker"]): ResolvedCredbrokerConfig {
+  const baseUrl = isString(raw?.baseUrl) ? raw!.baseUrl.replace(/\/+$/, "") : null;
+  if (!baseUrl) {
+    return { baseUrl: null, embeddingUrl: null, geminiUrl: null, tavilyUrl: null };
+  }
+  const services = raw?.services ?? {};
+  const tail = (name: string, fallback: string) =>
+    isString(services[name as keyof typeof services])
+      ? (services[name as keyof typeof services] as string)
+      : fallback;
+  return {
+    baseUrl,
+    embeddingUrl: `${baseUrl}/v1/proxy/${tail("embedding", "local-embed")}`,
+    geminiUrl:    `${baseUrl}/v1/proxy/${tail("gemini",    "gemini")}`,
+    // Tavily is hit as `/v1/proxy/tavily/search` (the `/search` is appended
+    // by the worker tool); store the service-root here, not the full URL.
+    tavilyUrl:    `${baseUrl}/v1/proxy/${tail("tavily",    "tavily")}/search`,
+  };
+}
+
+function resolveModeratorConfig(
+  raw: ModeratorConfig | undefined,
+  credbroker: ResolvedCredbrokerConfig,
+): ResolvedModeratorConfig {
   const block = raw ?? ({} as ModeratorConfig);
   const modelBlock = block.model ?? ({} as NonNullable<ModeratorConfig["model"]>);
   const format = modelBlock.format === "gemini" ? "gemini" : "openai";
+  // Credbroker proxies Gemini only — for openai we never derive.
+  const credbrokerFallback = format === "gemini" ? credbroker.geminiUrl : null;
   return {
     enabled: bool(block.enabled, false),
     debounceMs: Math.max(100, num(block.debounceMs, 1500)),
     model: {
       format,
-      baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : "",
+      baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : (credbrokerFallback ?? ""),
       model: isString(modelBlock.model) ? modelBlock.model
         : format === "gemini" ? "gemini-2.5-flash" : "gpt-5.5",
       apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
@@ -460,12 +524,14 @@ function resolveModeratorConfig(raw: ModeratorConfig | undefined): ResolvedModer
 
 function resolveReflectionConfig(
   raw: ReflectionConfig | undefined,
+  credbroker: ResolvedCredbrokerConfig,
 ): ResolvedReflectionConfig {
   // Defaults are inert (`enabled=false`). When the user enables it without
   // a model block, we still produce a sane shape but the daemon won't start.
   const block = raw ?? ({} as ReflectionConfig);
   const modelBlock = block.model ?? ({} as ReflectionModelConfig);
   const format = modelBlock.format === "gemini" ? "gemini" : "openai";
+  const credbrokerFallback = format === "gemini" ? credbroker.geminiUrl : null;
   return {
     enabled: bool(block.enabled, false),
     intervalMs: Math.max(60 * 60 * 1000, num(block.intervalMs, 24 * 60 * 60 * 1000)),
@@ -473,7 +539,7 @@ function resolveReflectionConfig(
     maxInputChars: Math.max(500, num(block.maxInputChars, 8000)),
     model: {
       format,
-      baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : "",
+      baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : (credbrokerFallback ?? ""),
       model: isString(modelBlock.model) ? modelBlock.model
         : format === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini",
       apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
@@ -513,14 +579,24 @@ const EMBEDDING_DEFAULTS: Record<
 
 function resolveEmbeddingConfig(
   raw: NonNullable<MemoryPostgresConfig["embedding"]> | undefined,
+  credbroker: ResolvedCredbrokerConfig,
 ): ResolvedMemoryPostgresConfig["embedding"] {
   const block = raw ?? {};
   const format = (block.format ?? "jina") as keyof typeof EMBEDDING_DEFAULTS;
   const defaults = EMBEDDING_DEFAULTS[format] ?? EMBEDDING_DEFAULTS.jina;
+  // Credbroker fallback: only for self-hosted formats (openai/ollama).
+  // For format=jina we KEEP the Jina cloud default so new users without
+  // credbroker get the free-tier path automatically.
+  const credbrokerFallback =
+    credbroker.embeddingUrl && (format === "openai" || format === "ollama")
+      ? credbroker.embeddingUrl
+      : null;
   return {
     provider: isString(block.provider) ? block.provider : defaults.provider,
     model: isString(block.model) ? block.model : defaults.model,
-    baseUrl: isString(block.baseUrl) ? block.baseUrl : defaults.baseUrl,
+    baseUrl: isString(block.baseUrl)
+      ? block.baseUrl
+      : credbrokerFallback ?? defaults.baseUrl,
     apiKeyEnv: isString(block.apiKeyEnv) ? block.apiKeyEnv : defaults.apiKeyEnv,
     dims: block.dims,
     format,

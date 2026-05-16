@@ -350,7 +350,16 @@ export async function dispatchWorker(
     `worker[${task.taskId}]: model invoked ${turn1.toolCalls.length} tool(s): ${turn1.toolCalls.map((c) => c.name).join(",")}`,
   );
   const toolResults = await executeToolsBatch(
-    { pool: deps.pool, embedding: deps.embedding, cfg: deps.cfg, agentId: deps.agentId, viewer },
+    {
+      pool: deps.pool,
+      embedding: deps.embedding,
+      cfg: deps.cfg,
+      agentId: deps.agentId,
+      viewer,
+      // Pulled from cfg.credbroker.tavilyUrl when set; falls back to env
+      // / hardcoded default in worker-tools.resolveWebSearchEndpoint.
+      webSearchUrl: deps.cfg.credbroker?.tavilyUrl ?? null,
+    },
     turn1.toolCalls,
   );
   const turn2 = await deps.workerLlm.chat({
