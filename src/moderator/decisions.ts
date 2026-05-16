@@ -52,7 +52,7 @@ Output schema:
   "action": <one of above>,
   "rationale": "<one sentence>",
   "memoryWrites": [{"text":"...","scope":"user"|"chat"|"global","topic":"...","importance":0..1,"visibility":"public"|"private"}],
-  "answerTasks": [{"taskId":"t1","roleKey":"<spec id>","taskPrompt":"...","memoryScope":{"topic":"..."},"canParallel":true,"newRoleSpec":{"systemPrompt":"<only if roleKey is brand new — design the specialist's voice & focus; will be persisted>","displayName":"..."}}],
+  "answerTasks": [{"taskId":"t1","roleKey":"<spec id>","taskPrompt":"...","memoryScope":{"topic":"..."},"canParallel":true,"newRoleSpec":{"systemPrompt":"<only if roleKey is brand new — design the specialist's voice & focus; will be persisted>","displayName":"...","tools":["memory_search"]}}],
   "telegramActions": [{"kind":"placeholder","taskId":"t1","text":"⏳ ..."},{"kind":"edit_placeholder","taskId":"t1","fromTaskResult":true}],
   "escalation": {"reason":"...","summary":"...","pauseScope":false},
   "noteAppend": "<optional one-liner>"

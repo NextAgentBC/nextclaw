@@ -33,6 +33,7 @@ import { executeDecision } from "./side-effects.js";
 import { TelegramBotApi } from "./telegram-api.js";
 import type { RecentMessage } from "./types.js";
 import { runWorkersForDecision, writeAnswerToCache } from "./workers.js";
+import type { WorkerLlmClient } from "./worker-llm.js";
 
 export type ModeratorServiceConfig = {
   enabled: boolean;
@@ -41,6 +42,10 @@ export type ModeratorServiceConfig = {
   /** Embedding client — needed for cache.qa L2 semantic lookup before
    *  the Moderator decision. Skips Gemini entirely on cache hits. */
   embedding: EmbeddingClient;
+  /** Tool-aware worker LLM client. Same backend as `llm` (typically) but
+   *  with multi-turn + tool-call support so workers can invoke
+   *  memory_search etc. mid-answer. */
+  workerLlm: WorkerLlmClient;
   /** Telegram bot token, from openclaw `channels.telegram.botToken`. */
   telegramBotToken: string;
   /** Bot owner user id (for escalation), from `commands.ownerAllowFrom[0]`. */
@@ -256,7 +261,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
       if (tasks.length > 0) {
         const wkDeps = {
           pool: config.pool,
-          llm: config.llm,
+          workerLlm: config.workerLlm,
           embedding: config.embedding,
           cfg: config.cfg,
           agentId: "main",

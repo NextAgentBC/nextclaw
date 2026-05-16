@@ -22,17 +22,19 @@
 
 import type { Pool } from "pg";
 import { randomUUID } from "node:crypto";
-import type { ModeratorLlm } from "./runner.js";
 import type { AnswerTask } from "./types.js";
 import type { EmbeddingClient } from "../embedding/client.js";
 import { recall } from "../recall/router.js";
 import type { ViewerScope } from "../recall/viewer-scope.js";
 import type { ResolvedMemoryPostgresConfig } from "../config.js";
 import { storeCachedAnswer } from "../cache/qa.js";
+import { chatSingle, exportToolResultsAsHistory, type WorkerLlmClient } from "./worker-llm.js";
+import { executeToolsBatch, resolveTools, type ToolCall } from "./worker-tools.js";
 
 export type WorkerDeps = {
   pool: Pool;
-  llm: ModeratorLlm;
+  /** Tool-aware LLM client (uses Gemini's :generateContent endpoint). */
+  workerLlm: WorkerLlmClient;
   embedding: EmbeddingClient;
   cfg: ResolvedMemoryPostgresConfig;
   agentId: string;
@@ -104,12 +106,22 @@ export async function upsertWorkerRole(
   if (Number.parseInt(cnt.rows[0]?.n ?? "0", 10) >= MAX_AGENT_CREATED_ROLES) {
     return false;
   }
+  // Whitelist: only allow tool names that actually exist in the registry.
+  // We never trust the LLM-supplied tool name verbatim — a typo or
+  // hallucinated tool would silently never run, but at least we don't
+  // store garbage in the DB.
+  const { listAvailableToolNames } = await import("./worker-tools.js");
+  const known = new Set(listAvailableToolNames());
+  const requestedTools = Array.isArray(spec.tools)
+    ? spec.tools.filter((t): t is string => typeof t === "string" && known.has(t))
+    : [];
+
   const r = await pool.query(
     `INSERT INTO moderator.worker_roles
        (id, agent_id, role_key, display_name, system_prompt, tools,
         memory_scope, model, created_by_scope)
-     VALUES (gen_random_uuid(), $1, $2, $3, $4, '{}'::text[],
-             $5::jsonb, $6, $7)
+     VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::text[],
+             $6::jsonb, $7, $8)
      ON CONFLICT (agent_id, role_key) DO NOTHING
      RETURNING id`,
     [
@@ -117,6 +129,7 @@ export async function upsertWorkerRole(
       roleKey,
       spec.displayName ?? roleKey,
       spec.systemPrompt,
+      requestedTools,
       JSON.stringify(spec.memoryScope ?? {}),
       DEFAULT_ROLE.model, // model preference inherits default; can be tuned per-row later
       createdByScope,
@@ -177,8 +190,10 @@ export type WorkerResult = {
     outputTokens?: number;
     latencyMs?: number;
   };
-  /** How many memory chunks were merged into the prompt. */
+  /** How many memory chunks were merged into the prompt (proactive recall, NOT tool). */
   recallCount: number;
+  /** Tool calls the model invoked during this dispatch (if any). */
+  toolCalls?: ToolCall[];
   errors: string[];
 };
 
@@ -273,29 +288,88 @@ export async function dispatchWorker(
   const userPrompt = userPromptParts.join("\n\n");
 
   // --- LLM call ---
-  let llmOut: Awaited<ReturnType<ModeratorLlm["call"]>>;
-  try {
-    llmOut = await deps.llm.call({
-      systemPrompt: role.systemPrompt,
-      userPrompt,
-      maxTokens: WORKER_MAX_OUTPUT_TOKENS,
-      temperature: 0.4,
-    });
-  } catch (e) {
-    return {
-      taskId: task.taskId,
-      roleKey: role.roleKey,
-      ok: false,
-      answer: "",
-      questionText: cleanedQ,
-      topicTag,
-      llm: {},
-      recallCount,
-      errors: [`llm-call-failed: ${(e as Error).message}`],
-    };
+  // Two paths:
+  //   - No tools allowlisted → single-shot (current behavior, zero regression)
+  //   - Tools available     → one round of tool-call → execute → final answer
+  const tools = resolveTools(role.tools);
+  const totals = { inputTokens: 0, outputTokens: 0, model: undefined as string | undefined };
+  const startLatency = Date.now();
+  let toolCallsExecuted: ToolCall[] = [];
+
+  if (tools.length === 0) {
+    // ----- single-shot path -----
+    const res = await chatSingle(deps.workerLlm, role.systemPrompt, userPrompt, WORKER_MAX_OUTPUT_TOKENS);
+    if (!res.ok) {
+      return failureResult(task, role, cleanedQ, topicTag, recallCount, res.error);
+    }
+    totals.inputTokens = res.inputTokens ?? 0;
+    totals.outputTokens = res.outputTokens ?? 0;
+    totals.model = res.model;
+    return successResult(task, role, res.text, cleanedQ, topicTag, recallCount, totals, Date.now() - startLatency, toolCallsExecuted);
   }
 
-  const answer = (llmOut.text ?? "").trim();
+  // ----- tool-call path: one round max -----
+  const turn1 = await deps.workerLlm.chat({
+    systemPrompt: role.systemPrompt,
+    history: [{ role: "user", text: userPrompt }],
+    tools,
+    maxOutputTokens: WORKER_MAX_OUTPUT_TOKENS,
+    temperature: 0.4,
+  });
+  if (!turn1.ok) {
+    return failureResult(task, role, cleanedQ, topicTag, recallCount, turn1.error);
+  }
+  totals.inputTokens += turn1.inputTokens ?? 0;
+  totals.outputTokens += turn1.outputTokens ?? 0;
+  totals.model = turn1.model;
+
+  // Model didn't call any tool — accept the text it returned (this is the
+  // expected path when the question is trivial).
+  if (!turn1.toolCalls || turn1.toolCalls.length === 0) {
+    return successResult(task, role, turn1.text, cleanedQ, topicTag, recallCount, totals, Date.now() - startLatency, toolCallsExecuted);
+  }
+
+  // Execute the tools, then ask for the final answer.
+  toolCallsExecuted = turn1.toolCalls;
+  deps.logger.info(
+    `worker[${task.taskId}]: model invoked ${turn1.toolCalls.length} tool(s): ${turn1.toolCalls.map((c) => c.name).join(",")}`,
+  );
+  const toolResults = await executeToolsBatch(
+    { pool: deps.pool, embedding: deps.embedding, cfg: deps.cfg, agentId: deps.agentId, viewer },
+    turn1.toolCalls,
+  );
+  const turn2 = await deps.workerLlm.chat({
+    systemPrompt: role.systemPrompt,
+    history: [
+      { role: "user", text: userPrompt },
+      ...exportToolResultsAsHistory(turn1.toolCalls, toolResults),
+    ],
+    tools, // still present in case model wants to refuse another call cleanly
+    maxOutputTokens: WORKER_MAX_OUTPUT_TOKENS,
+    temperature: 0.4,
+  });
+  if (!turn2.ok) {
+    return failureResult(task, role, cleanedQ, topicTag, recallCount, turn2.error);
+  }
+  totals.inputTokens += turn2.inputTokens ?? 0;
+  totals.outputTokens += turn2.outputTokens ?? 0;
+  // If the model tries to call MORE tools on the second turn we just take
+  // whatever text it has — we don't go to a 3rd round (cost + latency).
+  return successResult(task, role, turn2.text, cleanedQ, topicTag, recallCount, totals, Date.now() - startLatency, toolCallsExecuted);
+}
+
+function successResult(
+  task: AnswerTask,
+  role: RoleSpec,
+  rawText: string,
+  cleanedQ: string,
+  topicTag: string | undefined,
+  recallCount: number,
+  totals: { inputTokens: number; outputTokens: number; model: string | undefined },
+  latencyMs: number,
+  toolCallsExecuted: ToolCall[],
+): WorkerResult {
+  const answer = (rawText ?? "").trim();
   const ok = answer.length > 0 && !answer.startsWith(`{"action":"ignore"`); // sentinel guard
   return {
     taskId: task.taskId,
@@ -305,13 +379,35 @@ export async function dispatchWorker(
     questionText: cleanedQ,
     topicTag,
     llm: {
-      model: llmOut.model,
-      inputTokens: llmOut.inputTokens,
-      outputTokens: llmOut.outputTokens,
-      latencyMs: llmOut.latencyMs,
+      model: totals.model,
+      inputTokens: totals.inputTokens,
+      outputTokens: totals.outputTokens,
+      latencyMs,
     },
     recallCount,
+    toolCalls: toolCallsExecuted.length > 0 ? toolCallsExecuted : undefined,
     errors: ok ? [] : ["empty-or-fallback-llm-output"],
+  };
+}
+
+function failureResult(
+  task: AnswerTask,
+  role: RoleSpec,
+  cleanedQ: string,
+  topicTag: string | undefined,
+  recallCount: number,
+  errorMsg: string,
+): WorkerResult {
+  return {
+    taskId: task.taskId,
+    roleKey: role.roleKey,
+    ok: false,
+    answer: "",
+    questionText: cleanedQ,
+    topicTag,
+    llm: {},
+    recallCount,
+    errors: [`llm-call-failed: ${errorMsg}`],
   };
 }
 
