@@ -123,18 +123,28 @@ function jaccardOverlap(a: string, b: string): number {
 const REGISTRY = new Map<string, WorkingSet>();
 
 /**
- * Working set is keyed by `<agentId>::<sessionId>` so isolation holds even
- * when sessionId is missing — without the agent prefix, two different
- * agents (main/club) without a session would share the same working set
- * and one could pull the other's recently-promoted chunks (real leak path
- * caught during isolation testing).
+ * Working set is keyed by `<agentId>::<sessionId>::<viewerUserId>` so
+ * isolation holds even when sessionId is missing. Three layered concerns:
+ *
+ *   - agentId prefix prevents two different agents (main/club) without a
+ *     session from sharing the same WS (caught during isolation testing).
+ *   - sessionId scopes per chat / channel pairing — different DMs get
+ *     different sets.
+ *   - viewerUserId scopes per HUMAN inside a group chat. Without this,
+ *     a group chat (one sessionId, many students) would let student-A's
+ *     pinned profile chunks surface in student-B's T0 lookups. With it,
+ *     each student gets their own warm-cache view of the group.
+ *
+ * `viewerUserId` defaults to "default" so DM-only callers keep their
+ * current behavior unchanged (sessionId already distinguishes peers).
  */
 export function workingSetFor(
   sessionId: string | undefined,
   maxSize: number,
   agentId: string | undefined = "main",
+  viewerUserId: string | undefined = "default",
 ): WorkingSet {
-  const key = `${agentId ?? "main"}::${sessionId ?? "default"}`;
+  const key = `${agentId ?? "main"}::${sessionId ?? "default"}::${viewerUserId ?? "default"}`;
   let set = REGISTRY.get(key);
   if (!set) {
     set = new WorkingSet(maxSize);

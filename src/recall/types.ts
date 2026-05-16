@@ -75,4 +75,18 @@ export type RecallContext = {
   queryEmbedding?: number[];
   /** Owning agent id — every SQL route filters `chunks.agent_id = $X`. */
   agentId?: string;
+  /**
+   * Viewer scope — WHO is asking and IN WHICH chat. Used to apply the
+   * three-tier privacy filter (see src/recall/viewer-scope.ts):
+   *   - viewer.userId       = the asking human's stable id (telegram user id, etc.)
+   *   - viewer.chatId       = the chat the question was asked in (group id);
+   *                            omit for DMs
+   * When omitted entirely, viewer-scope filtering is bypassed (legacy
+   * single-user behaviour). For multi-user groups this MUST be set, or
+   * private DM facts from other students can leak across the group.
+   */
+  viewer?: {
+    userId?: string;
+    chatId?: string;
+  };
 };

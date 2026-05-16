@@ -122,6 +122,27 @@ export type MemoryPostgresConfig = {
    * and pointing `model` at an OpenAI-compat or native-Gemini endpoint.
    */
   reflection?: ReflectionConfig;
+  /**
+   * Moderator service (Phase C). When enabled, hooks openclaw's
+   * Telegram `message_received` event and runs an orchestrator-worker
+   * decision loop for every inbound message in a group / supergroup
+   * (DMs pass through unchanged so the existing per-DM agent path
+   * keeps working). Off by default — opt in.
+   */
+  moderator?: ModeratorConfig;
+};
+
+export type ModeratorConfig = {
+  enabled?: boolean;
+  /** LLM transport — mirrors reflection.model. Default: gpt-5.5 via OpenAI. */
+  model?: {
+    format: "openai" | "gemini";
+    baseUrl: string;
+    model: string;
+    apiKeyEnv?: string;
+  };
+  /** Per (scope, user) burst-collapse window. Default 1500ms. */
+  debounceMs?: number;
 };
 
 export type ReflectionConfig = {
@@ -264,6 +285,18 @@ export type ResolvedMemoryPostgresConfig = {
   transcriptWatchers: ResolvedTranscriptWatcher[];
   shadowComparators: ResolvedShadowComparator[];
   reflection: ResolvedReflectionConfig;
+  moderator: ResolvedModeratorConfig;
+};
+
+export type ResolvedModeratorConfig = {
+  enabled: boolean;
+  debounceMs: number;
+  model: {
+    format: "openai" | "gemini";
+    baseUrl: string;
+    model: string;
+    apiKeyEnv?: string;
+  };
 };
 
 export type ResolvedReflectionConfig = {
@@ -404,6 +437,24 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
     transcriptWatchers: (raw.transcriptWatchers ?? []).map(resolveTranscriptWatcher),
     shadowComparators: (raw.shadowComparators ?? []).map(resolveShadowComparator),
     reflection: resolveReflectionConfig(raw.reflection),
+    moderator: resolveModeratorConfig(raw.moderator),
+  };
+}
+
+function resolveModeratorConfig(raw: ModeratorConfig | undefined): ResolvedModeratorConfig {
+  const block = raw ?? ({} as ModeratorConfig);
+  const modelBlock = block.model ?? ({} as NonNullable<ModeratorConfig["model"]>);
+  const format = modelBlock.format === "gemini" ? "gemini" : "openai";
+  return {
+    enabled: bool(block.enabled, false),
+    debounceMs: Math.max(100, num(block.debounceMs, 1500)),
+    model: {
+      format,
+      baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : "",
+      model: isString(modelBlock.model) ? modelBlock.model
+        : format === "gemini" ? "gemini-2.5-flash" : "gpt-5.5",
+      apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
+    },
   };
 }
 

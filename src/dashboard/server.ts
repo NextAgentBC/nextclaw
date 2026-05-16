@@ -22,6 +22,14 @@ import { fileURLToPath } from "node:url";
 import type { Pool, PoolClient } from "pg";
 import type { ResolvedMemoryPostgresConfig } from "../config.js";
 import { buildEmbeddingClientFromConfig } from "../embedding/client.js";
+import {
+  cacheStats,
+  invalidateCachedAnswer,
+  lookupCachedAnswer,
+  recordCacheFeedback,
+  recordCacheHit,
+  storeCachedAnswer,
+} from "../cache/qa.js";
 import { ingestOne, type IngestInput } from "../ingest/pipeline.js";
 import { recall as recallFn, type RecallInput } from "../recall/router.js";
 import { readBotStats } from "./bot-stats.js";
@@ -255,6 +263,11 @@ async function handleRecall(
   const anchorsRaw = (typeof b["anchors"] === "object" && b["anchors"] !== null && !Array.isArray(b["anchors"]))
     ? (b["anchors"] as Record<string, unknown>)
     : {};
+  const viewerRaw = typeof b["viewer"] === "object" && b["viewer"] !== null && !Array.isArray(b["viewer"])
+    ? (b["viewer"] as Record<string, unknown>)
+    : {};
+  const viewerUserId = asStr(viewerRaw["userId"]);
+  const viewerChatId = asStr(viewerRaw["chatId"]);
   const input: RecallInput = {
     query,
     maxResults: asNum(b["k"]) ?? asNum(b["maxResults"]),
@@ -272,6 +285,9 @@ async function handleRecall(
       scope: asStr(anchorsRaw["scope"]),
     },
     timeBucket: asStr(b["timeBucket"]),
+    viewer: viewerUserId || viewerChatId
+      ? { userId: viewerUserId, chatId: viewerChatId }
+      : undefined,
   };
   const embedding = buildEmbeddingClientFromConfig({
     baseUrl: cfg.embedding.baseUrl,
@@ -301,6 +317,219 @@ async function handleRecall(
  * populated by the shadow-comparator worker. Returns aggregate stats per
  * challenger model + the recent N turns for the dashboard panel.
  */
+/* ----------------------------- cache.qa routes ---------------------------- */
+
+async function handleCacheLookup(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pool: Pool,
+  cfg: ResolvedMemoryPostgresConfig,
+): Promise<void> {
+  if (req.method !== "POST") {return send(res, 405, "method not allowed", "text/plain");}
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch (err) {
+    return sendJson(res, 400, { ok: false, error: (err as Error).message });
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return sendJson(res, 400, { ok: false, error: "body must be a JSON object" });
+  }
+  const b = body as Record<string, unknown>;
+  const questionText = asStr(b["question"]);
+  if (!questionText) {return sendJson(res, 400, { ok: false, error: "question is required" });}
+
+  const viewerRaw = typeof b["viewer"] === "object" && b["viewer"] !== null && !Array.isArray(b["viewer"])
+    ? (b["viewer"] as Record<string, unknown>) : {};
+  const viewer = {
+    userId: asStr(viewerRaw["userId"]),
+    chatId: asStr(viewerRaw["chatId"]),
+  };
+  const minSim = asNum(b["minSimilarity"]);
+  const topicTag = asStr(b["topicTag"]);
+  const agentId = asStr(b["agentId"]) ?? "main";
+
+  // For semantic path we need an embedding; if caller didn't precompute,
+  // we embed locally using the same embed client the recall path uses.
+  let questionEmbedding: number[] | undefined;
+  if (Array.isArray(b["questionEmbedding"])) {
+    questionEmbedding = b["questionEmbedding"] as number[];
+  } else if (b["embed"] !== false) {
+    const embedClient = buildEmbeddingClientFromConfig({
+      baseUrl: cfg.embedding.baseUrl,
+      model: cfg.embedding.model,
+      apiKeyEnv: cfg.embedding.apiKeyEnv,
+      format: cfg.embedding.format,
+      path: cfg.embedding.path,
+    });
+    const r = await embedClient.embed({ inputs: [questionText.slice(0, cfg.embedding.maxEmbedChars)], taskPrefix: "query" });
+    questionEmbedding = r.embeddings[0];
+  }
+
+  const hit = await lookupCachedAnswer(pool, {
+    agentId,
+    questionText,
+    questionEmbedding,
+    viewer: viewer.userId || viewer.chatId ? viewer : undefined,
+    minSimilarity: minSim,
+    topicTag,
+  });
+  if (hit) {
+    await recordCacheHit(pool, hit.id);
+  }
+  sendJson(res, 200, { ok: true, hit });
+}
+
+async function handleCacheStore(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pool: Pool,
+  cfg: ResolvedMemoryPostgresConfig,
+): Promise<void> {
+  if (req.method !== "POST") {return send(res, 405, "method not allowed", "text/plain");}
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch (err) {
+    return sendJson(res, 400, { ok: false, error: (err as Error).message });
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return sendJson(res, 400, { ok: false, error: "body must be a JSON object" });
+  }
+  const b = body as Record<string, unknown>;
+  const questionText = asStr(b["question"]);
+  const answerText = asStr(b["answer"]);
+  if (!questionText || !answerText) {
+    return sendJson(res, 400, { ok: false, error: "question and answer required" });
+  }
+  const embedClient = buildEmbeddingClientFromConfig({
+    baseUrl: cfg.embedding.baseUrl,
+    model: cfg.embedding.model,
+    apiKeyEnv: cfg.embedding.apiKeyEnv,
+    format: cfg.embedding.format,
+    path: cfg.embedding.path,
+  });
+  const embedRes = await embedClient.embed({ inputs: [questionText.slice(0, cfg.embedding.maxEmbedChars)] });
+  const scopeRaw = typeof b["scope"] === "object" && b["scope"] !== null && !Array.isArray(b["scope"])
+    ? (b["scope"] as Record<string, unknown>) : {};
+  const id = await storeCachedAnswer(pool, {
+    agentId: asStr(b["agentId"]) ?? "main",
+    questionText,
+    questionEmbedding: embedRes.embeddings[0] ?? [],
+    embeddingModel: embedRes.model,
+    answerText,
+    answerFormat: (asStr(b["answerFormat"]) as "plain" | "markdown" | "latex") ?? "plain",
+    scope: {
+      chatId: asStr(scopeRaw["chatId"]),
+      senderId: asStr(scopeRaw["senderId"]),
+      visibility: (asStr(scopeRaw["visibility"]) as "public" | "private" | "chat-only") ?? "public",
+    },
+    topicTag: asStr(b["topicTag"]),
+    source: (asStr(b["source"]) as "agent" | "csv-seed" | "manual") ?? "manual",
+    sourceDocId: asStr(b["sourceDocId"]),
+    ttlDays: asNum(b["ttlDays"]),
+  });
+  sendJson(res, 200, { ok: true, id });
+}
+
+async function handleCacheFeedback(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pool: Pool,
+): Promise<void> {
+  if (req.method !== "POST") {return send(res, 405, "method not allowed", "text/plain");}
+  const body = await readJsonBody(req) as Record<string, unknown>;
+  const id = asStr(body["id"]);
+  const vote = asStr(body["vote"]);
+  if (!id || (vote !== "up" && vote !== "down")) {
+    return sendJson(res, 400, { ok: false, error: "id and vote=up|down required" });
+  }
+  await recordCacheFeedback(pool, id, vote);
+  sendJson(res, 200, { ok: true });
+}
+
+async function handleCacheInvalidate(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pool: Pool,
+): Promise<void> {
+  if (req.method !== "POST") {return send(res, 405, "method not allowed", "text/plain");}
+  const body = await readJsonBody(req) as Record<string, unknown>;
+  const id = asStr(body["id"]);
+  const reason = asStr(body["reason"]) ?? "manual";
+  if (!id) {return sendJson(res, 400, { ok: false, error: "id required" });}
+  await invalidateCachedAnswer(pool, id, reason);
+  sendJson(res, 200, { ok: true });
+}
+
+async function handleCacheStatsRoute(res: ServerResponse, pool: Pool): Promise<void> {
+  const rows = await cacheStats(pool, "main");
+  sendJson(res, 200, { ok: true, byTopic: rows });
+}
+
+async function handleCacheRecent(res: ServerResponse, pool: Pool): Promise<void> {
+  // Top entries by use_count for the dashboard "popular Q&A" panel.
+  const r = await pool.query<{
+    id: string;
+    question_text: string;
+    answer_text: string;
+    topic_tag: string | null;
+    use_count: number;
+    upvotes: number;
+    downvotes: number;
+    scope_visibility: string;
+    scope_chat_id: string | null;
+    source: string;
+    source_doc_id: string | null;
+    last_used_at: Date | null;
+  }>(
+    `SELECT id, question_text, answer_text, topic_tag,
+            use_count, upvotes, downvotes, scope_visibility, scope_chat_id,
+            source, source_doc_id, last_used_at
+       FROM cache.qa
+      WHERE agent_id = 'main' AND NOT invalidated AND cacheable
+      ORDER BY use_count DESC, (upvotes - downvotes) DESC, created_at DESC
+      LIMIT 50`,
+  );
+  sendJson(res, 200, {
+    ok: true,
+    entries: r.rows.map((row) => ({
+      id: row.id,
+      question: row.question_text,
+      answer: row.answer_text.length > 240 ? row.answer_text.slice(0, 237) + "..." : row.answer_text,
+      topicTag: row.topic_tag,
+      useCount: row.use_count,
+      net: row.upvotes - row.downvotes,
+      scope: row.scope_chat_id ? `chat:${row.scope_chat_id}` : row.scope_visibility,
+      source: row.source_doc_id ? `${row.source}:${row.source_doc_id}` : row.source,
+      lastUsedAt: row.last_used_at,
+    })),
+  });
+}
+
+async function handleKbList(res: ServerResponse): Promise<void> {
+  // Read the most-recent N entries from the KB upload audit log.
+  // Source of truth lives under OPENCLAW_KB_ROOT / _meta / upload-log.jsonl.
+  // We don't hold the log open — read-then-close keeps the endpoint cheap.
+  const kbRoot = process.env.OPENCLAW_KB_ROOT
+    || path.join(homedir(), ".openclaw", "kb");
+  const logPath = path.join(kbRoot, "_meta", "upload-log.jsonl");
+  let raw = "";
+  try {
+    raw = await readFile(logPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      sendJson(res, 500, { ok: false, error: `read kb log: ${(err as Error).message}` });
+      return;
+    }
+    raw = "";
+  }
+  const lines = raw.split(/\n+/).filter((l) => l.trim().length > 0);
+  // Newest last; show last 100, newest first.
+  const recent = lines.slice(-100).reverse();
+  const entries: unknown[] = [];
+  for (const l of recent) {
+    try {entries.push(JSON.parse(l));} catch { /* skip malformed */ }
+  }
+  sendJson(res, 200, { ok: true, entries, total: lines.length, kbRoot });
+}
+
 async function handleModelCompare(res: ServerResponse, pool: Pool): Promise<void> {
   // Aggregates per challenger model, last 24h.
   const agg = await pool.query(
@@ -536,6 +765,27 @@ export async function startDashboardServer(
           return;
         case "/api/ingest":
           await handleIngest(req, res, pool, cfg);
+          return;
+        case "/api/cache/lookup":
+          await handleCacheLookup(req, res, pool, cfg);
+          return;
+        case "/api/cache/store":
+          await handleCacheStore(req, res, pool, cfg);
+          return;
+        case "/api/cache/feedback":
+          await handleCacheFeedback(req, res, pool);
+          return;
+        case "/api/cache/invalidate":
+          await handleCacheInvalidate(req, res, pool);
+          return;
+        case "/api/cache/stats":
+          await handleCacheStatsRoute(res, pool);
+          return;
+        case "/api/cache/recent":
+          await handleCacheRecent(res, pool);
+          return;
+        case "/api/kb/list":
+          await handleKbList(res);
           return;
         default:
           send(res, 404, "not found", "text/plain");

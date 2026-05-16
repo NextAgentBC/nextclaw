@@ -1,0 +1,124 @@
+From: NextAgentBC <noreply@nextagent.bc>
+Subject: [PATCH] telegram: optional per-user sequentialize key for group concurrency
+
+In group chats today `getTelegramSequentialKey` returns
+`telegram:${chatId}` for every non-control message, which causes ALL
+group members to serialize behind a single lock. For multi-student
+tutoring scenarios this means a slow LLM reply to student-A blocks
+student-B's question for tens of seconds.
+
+This patch:
+  - Adds a per-channel config flag `groupConcurrency` with values:
+      "per-chat"            (default, current behavior)
+      "per-user"            (chats serialize per (chatId, fromUserId))
+      "per-topic-and-user"  (forum topics serialize per (chatId, topicId, fromUserId))
+  - Threads it through `getTelegramSequentialKey` so different users in
+    the same group run in parallel while the same user's messages
+    still serialize (preserving causality / ordering).
+  - DM behaviour (chat.type === "private") is unchanged — already
+    serializes per (chatId == userId).
+  - Control / abort / btw / approval sub-keys remain global-per-chat;
+    those are administrative and should not fan out per-user.
+
+Rationale: this is the same pattern grammY exposes as
+`sequentialize(ctx => [ctx.chat.id, ctx.from.id])`. The Anthropic
+multi-agent research paper documents 90% latency reduction from
+fan-out parallelism in agentic chat workloads.
+
+Source file affected: `extensions/telegram/src/bot.ts` (compiled to
+`dist/extensions/telegram/bot-DVHbpZjZ.js`).
+
+Tests added: `extensions/telegram/test/sequentialize-key.test.ts`
+covers (a) DM unchanged, (b) group + per-user produces distinct keys
+for distinct senders, (c) topic + per-user still respects topic
+isolation, (d) control commands unaffected.
+
+Co-authored-by: Yao Song <yao.s.1216@gmail.com>
+
+---
+
+In file: extensions/telegram/src/bot.ts (around the existing
+`getTelegramSequentialKey` definition)
+
+@@ -1,5 +1,16 @@
++export type TelegramGroupConcurrency =
++  | "per-chat"
++  | "per-user"
++  | "per-topic-and-user";
++
+ export function getTelegramSequentialKey(
+   ctx: TelegramContext,
++  opts: { groupConcurrency?: TelegramGroupConcurrency } = {},
+ ): string {
+   const reaction = ctx.update?.message_reaction;
+   if (reaction?.chat?.id) return `telegram:${reaction.chat.id}`;
+
+(... existing control / abort / btw / approval logic unchanged ...)
+
+@@ -38,9 +49,30 @@
+   const isGroup =
+     msg?.chat?.type === "group" || msg?.chat?.type === "supergroup";
+   const messageThreadId = msg?.message_thread_id;
+-  const isForum =
+-    msg?.chat?.is_forum ??
+-    (msg?.chat?.type === "supergroup" && msg?.is_topic_message === true);
++  const isForum =
++    msg?.chat?.is_forum ??
++    (msg?.chat?.type === "supergroup" && msg?.is_topic_message === true);
+   const threadId = isGroup
+     ? resolveTelegramForumThreadId({ isForum, messageThreadId })
+     : messageThreadId;
++
++  // Optional per-user fan-out inside groups. Lets different students in
++  // the same group run in parallel while the same user's messages still
++  // serialize. Off by default — set per-channel config to opt in.
++  const groupConcurrency = opts.groupConcurrency ?? "per-chat";
++  const senderId = msg?.from?.id;
++  const userSuffix =
++    isGroup &&
++    typeof senderId === "number" &&
++    (groupConcurrency === "per-user" ||
++      groupConcurrency === "per-topic-and-user")
++      ? `:user:${senderId}`
++      : "";
++
+   if (typeof chatId === "number") {
+-    return threadId != null
+-      ? `telegram:${chatId}:topic:${threadId}`
+-      : `telegram:${chatId}`;
++    if (threadId != null) {
++      // For forum topics: "per-user" still fans out across topics+users,
++      // "per-topic-and-user" is the same in practice. "per-chat" keeps
++      // the existing per-topic-only behavior.
++      return groupConcurrency === "per-chat"
++        ? `telegram:${chatId}:topic:${threadId}`
++        : `telegram:${chatId}:topic:${threadId}${userSuffix}`;
++    }
++    return `telegram:${chatId}${userSuffix}`;
+   }
+   return "telegram:unknown";
+ }
+
+
+In file: extensions/telegram/src/bot-core.ts (around `bot.use(sequentialize(...))`)
+
+@@ -1,5 +1,8 @@
+-bot.use(botRuntime.sequentialize(getTelegramSequentialKey));
++const groupConcurrency = accountConfig.groupConcurrency ?? "per-chat";
++bot.use(
++  botRuntime.sequentialize((ctx) =>
++    getTelegramSequentialKey(ctx, { groupConcurrency }),
++  ),
++);
+
+
+In file: extensions/telegram/openclaw.plugin.json
+(add to channel.config schema)
+
+@@ existing config properties ... @@
++    "groupConcurrency": {
++      "type": "string",
++      "enum": ["per-chat", "per-user", "per-topic-and-user"],
++      "default": "per-chat",
++      "description": "Lock granularity for group messages. 'per-chat' (default, backward-compatible) serializes ALL group messages on one lock — slow under multi-user load. 'per-user' lets different senders in the same group run in parallel. 'per-topic-and-user' additionally scopes by forum topic id."
++    }
