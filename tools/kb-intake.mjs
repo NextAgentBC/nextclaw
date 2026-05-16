@@ -231,10 +231,13 @@ async function main() {
   let chunksWritten = 0;
   let ingestErrors = [];
   if (willIngest) {
+    const sharedCtx = { docId, version, decision, hints, senderUserId, chatId, ownerId };
     if (ext === ".md" || ext === ".markdown" || ext === ".txt") {
-      const result = await ingestMarkdown(targetPath, {
-        docId, version, decision, hints, senderUserId, chatId, ownerId,
-      });
+      const result = await ingestMarkdown(targetPath, sharedCtx);
+      chunksWritten = result.chunksWritten;
+      ingestErrors = result.errors;
+    } else if (ext === ".pdf") {
+      const result = await ingestPdf(targetPath, sharedCtx);
       chunksWritten = result.chunksWritten;
       ingestErrors = result.errors;
     } else {
@@ -274,8 +277,8 @@ async function main() {
 }
 
 function ingestEligibility(ext) {
-  const supported = new Set([".md", ".markdown", ".txt"]);
-  const pending = new Set([".pdf", ".docx", ".csv", ".html", ".htm"]);
+  const supported = new Set([".md", ".markdown", ".txt", ".pdf"]);
+  const pending = new Set([".docx", ".csv", ".html", ".htm"]);
   const storeOnly = new Set([".png", ".jpg", ".jpeg", ".heic", ".mp3", ".ogg", ".wav", ".m4a", ".mp4", ".mov"]);
   if (supported.has(ext)) {return { canIngest: true, parser: ext.replace(".", "") };}
   if (pending.has(ext)) {return { canIngest: false, reason: `${ext.slice(1)} parser not yet implemented` };}
@@ -323,6 +326,99 @@ async function ingestMarkdown(absPath, { docId, version, decision, hints, sender
     }
   }
   return { chunksWritten: ok, errors };
+}
+
+/* ---------------------------------- pdf ----------------------------------- */
+/**
+ * Extract PDF text via pdf-parse, then split into page-aware chunks.
+ *
+ * pdf-parse delivers ALL extracted text as one long string; pages are
+ * separated by form-feed (\f). We:
+ *   1. Split on \f → array of per-page strings.
+ *   2. Within each page, split by paragraph (double blank lines) and
+ *      group paragraphs until the chunk hits ~1500 chars.
+ *   3. Drop chunks shorter than 80 chars (page headers, footers).
+ *   4. source_ref carries "page:N" so the agent can cite back.
+ *
+ * Note: pure-text PDFs only. Scanned-image PDFs need OCR — that's a
+ * future enhancement via credbroker's ASR-style service or tesseract.
+ */
+async function ingestPdf(absPath, ctx) {
+  const { docId, version, decision, hints, senderUserId, chatId, ownerId } = ctx;
+  const pdfModule = await import("pdf-parse").then((m) => m.default ?? m);
+  const buf = await readFile(absPath);
+  let parsed;
+  try {
+    parsed = await pdfModule(buf);
+  } catch (err) {
+    return { chunksWritten: 0, errors: [`pdf-parse failed: ${err.message}`] };
+  }
+  const pages = (parsed.text ?? "").split("\f");
+  const anchors = buildAnchors(ctx);
+
+  let ok = 0;
+  const errors = [];
+  for (const [pageIdx, pageRaw] of pages.entries()) {
+    const pageNum = pageIdx + 1;
+    const pageText = pageRaw.replace(/ /g, "").trim();
+    if (pageText.length < 80) {continue;}
+    const chunks = splitByParagraph(pageText, 1500);
+    for (const [secIdx, body] of chunks.entries()) {
+      if (body.length < 80) {continue;}
+      const sourceRef = `${docId}:v${version}:page:${pageNum}${chunks.length > 1 ? `:s${secIdx + 1}` : ""}`;
+      const text = `[page ${pageNum}]\n\n${body}`;
+      try {
+        const r = await fetch(`${apiBase}/api/ingest`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-token": dashToken },
+          body: JSON.stringify({
+            text,
+            source: `kb:${docId}`,
+            sourceRef,
+            kind: "knowledge",
+            agentId: "main",
+            importance: 0.7,
+            retentionClass: "pinned",
+            anchors,
+          }),
+        });
+        if (!r.ok) {throw new Error(`HTTP ${r.status}`);}
+        const j = await r.json();
+        if (j?.outcome?.decision === "accepted" || j?.outcome?.decision === "merged") {ok += 1;}
+      } catch (err) {
+        errors.push(`page:${pageNum}:s${secIdx + 1} → ${err.message}`);
+      }
+    }
+  }
+  return { chunksWritten: ok, errors };
+}
+
+function buildAnchors({ docId, decision, hints, senderUserId, chatId, ownerId }) {
+  const anchors = { sender_label: `kb:${docId}` };
+  if (decision.scope === "chat" && chatId) {anchors.chat_id = tgPath(chatId);}
+  if (decision.scope === "user" && senderUserId !== ownerId) {anchors.sender_id = `tg-${senderUserId}`;}
+  if (decision.visibility !== "public") {anchors.visibility = decision.visibility;}
+  if (hints.topic) {anchors.scope = hints.topic;}
+  return anchors;
+}
+
+function splitByParagraph(body, maxChars = 1500) {
+  // Split on blank-line paragraph boundaries; combine paragraphs into
+  // chunks of up to maxChars while keeping paragraph boundaries intact.
+  const paragraphs = body.split(/\n\s*\n+/).map((p) => p.trim()).filter((p) => p.length > 0);
+  const out = [];
+  let buf = [];
+  let bufLen = 0;
+  for (const p of paragraphs) {
+    if (bufLen + p.length > maxChars && buf.length > 0) {
+      out.push(buf.join("\n\n"));
+      buf = [p]; bufLen = p.length;
+    } else {
+      buf.push(p); bufLen += p.length + 2;
+    }
+  }
+  if (buf.length > 0) {out.push(buf.join("\n\n"));}
+  return out;
 }
 
 function splitMarkdown(body, maxChars = 1500) {
