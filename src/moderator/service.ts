@@ -263,7 +263,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
           logger: config.logger,
         };
         const viewer = { userId: senderUserId, chatId };
-        const results = await runWorkersForDecision(wkDeps, tasks, viewer, trigger.text);
+        const results = await runWorkersForDecision(wkDeps, tasks, viewer, trigger.text, scopeKey);
         for (const r of results) {
           // Find the placeholder message_id for this task: first try
           // fx.placeholders (this cycle), fall back to activeWorkers

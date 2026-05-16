@@ -68,6 +68,63 @@ const DEFAULT_ROLE: RoleSpec = {
   model: "gemini:gemini-2.5-flash",
 };
 
+/* --------------------------- role auto-register --------------------------- */
+
+/**
+ * Cap on agent-created roles per agent_id. Hard guard against a runaway
+ * Moderator polluting the registry with garbage roleKeys. Operator-seeded
+ * rows (created_by_scope IS NULL) don't count toward the limit.
+ */
+const MAX_AGENT_CREATED_ROLES = 200;
+
+/**
+ * Insert a new worker role if it doesn't already exist. Operator-seeded
+ * rows (with no `created_by_scope`) always win — if a row exists for
+ * this (agent_id, role_key), we DO NOT overwrite. Returns true if a row
+ * was actually inserted.
+ *
+ * Why first-write-wins for agent rows: the Moderator's first design for
+ * a roleKey is the canonical one. If a later decision proposes a
+ * different prompt for the SAME key, that's a sign the model is
+ * confused — better to use the original than churn the registry.
+ */
+export async function upsertWorkerRole(
+  pool: Pool,
+  agentId: string,
+  roleKey: string,
+  spec: NonNullable<import("./types.js").AnswerTask["newRoleSpec"]>,
+  createdByScope: string,
+): Promise<boolean> {
+  // Soft cap — refuse silently if the agent has too many roles already.
+  const cnt = await pool.query<{ n: string }>(
+    `SELECT COUNT(*)::text AS n FROM moderator.worker_roles
+     WHERE agent_id = $1 AND created_by_scope IS NOT NULL`,
+    [agentId],
+  );
+  if (Number.parseInt(cnt.rows[0]?.n ?? "0", 10) >= MAX_AGENT_CREATED_ROLES) {
+    return false;
+  }
+  const r = await pool.query(
+    `INSERT INTO moderator.worker_roles
+       (id, agent_id, role_key, display_name, system_prompt, tools,
+        memory_scope, model, created_by_scope)
+     VALUES (gen_random_uuid(), $1, $2, $3, $4, '{}'::text[],
+             $5::jsonb, $6, $7)
+     ON CONFLICT (agent_id, role_key) DO NOTHING
+     RETURNING id`,
+    [
+      agentId,
+      roleKey,
+      spec.displayName ?? roleKey,
+      spec.systemPrompt,
+      JSON.stringify(spec.memoryScope ?? {}),
+      DEFAULT_ROLE.model, // model preference inherits default; can be tuned per-row later
+      createdByScope,
+    ],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
 /* ----------------------------- role loading ------------------------------- */
 
 export async function loadRoleSpec(
@@ -147,7 +204,34 @@ export async function dispatchWorker(
   viewer: ViewerScope | undefined,
   /** Raw question text from the user (pre-cleaning). */
   userQuestion: string,
+  /** Scope key the Moderator is acting in, e.g. `tg:chat:-100...`. Used to
+   *  attribute newly-registered roles so we can audit which scope coined them. */
+  scopeKey: string,
 ): Promise<WorkerResult> {
+  // If the Moderator declared a new specialist inline, persist it BEFORE
+  // loading the role spec. First-write-wins via ON CONFLICT DO NOTHING,
+  // so a race between two parallel tasks for the same brand-new key is
+  // safe — both insert attempts coalesce, both subsequent loads see the
+  // same row. Failure to upsert (e.g. cap reached) just falls back to
+  // DEFAULT_ROLE, mirroring the pre-leverage behavior.
+  if (task.newRoleSpec) {
+    try {
+      const created = await upsertWorkerRole(
+        deps.pool,
+        deps.agentId,
+        task.roleKey,
+        task.newRoleSpec,
+        scopeKey,
+      );
+      if (created) {
+        deps.logger.info(
+          `worker[${task.taskId}]: registered new role '${task.roleKey}' (${task.newRoleSpec.systemPrompt.length} chars)`,
+        );
+      }
+    } catch (e) {
+      deps.logger.warn(`worker[${task.taskId}]: role upsert failed: ${(e as Error).message}`);
+    }
+  }
   const role = await loadRoleSpec(deps.pool, deps.agentId, task.roleKey);
   const cleanedQ = cleanQuestionText(userQuestion);
   const topicTag = task.memoryScope?.topic ?? role.memoryScope.topic;
@@ -244,15 +328,18 @@ export async function runWorkersForDecision(
   tasks: AnswerTask[],
   viewer: ViewerScope | undefined,
   userQuestion: string,
+  scopeKey: string,
 ): Promise<WorkerResult[]> {
   if (tasks.length === 0) {return [];}
   const parallel = tasks.filter((t) => t.canParallel !== false);
   const serial = tasks.filter((t) => t.canParallel === false);
 
-  const parResults = await Promise.all(parallel.map((t) => dispatchWorker(deps, t, viewer, userQuestion)));
+  const parResults = await Promise.all(
+    parallel.map((t) => dispatchWorker(deps, t, viewer, userQuestion, scopeKey)),
+  );
   const serResults: WorkerResult[] = [];
   for (const t of serial) {
-    serResults.push(await dispatchWorker(deps, t, viewer, userQuestion));
+    serResults.push(await dispatchWorker(deps, t, viewer, userQuestion, scopeKey));
   }
   return [...parResults, ...serResults];
 }
