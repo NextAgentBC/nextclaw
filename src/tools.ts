@@ -89,15 +89,33 @@ type StoreParams = {
 };
 
 /**
- * sessionKey shape is `agent:<agentId>:<sessionId>`. Pull out the agentId so
+ * Expected sessionKey shape: `agent:<agentId>:<sessionId>` (or longer with
+ * trailing colons for channel-scoped keys). Pull out `<agentId>` so
  * memory_search / memory_store called from the `club` agent can never see
- * the `main` agent's chunks (and vice versa). Falls back to "main" so DM
- * sessions and any caller without a sessionKey keep the historical default.
+ * the `main` agent's chunks (and vice versa).
+ *
+ * Fail-closed: if the sessionKey is present but does NOT match the expected
+ * shape, throw. Silently falling back to "main" was the original behavior,
+ * but it means a future openclaw release that changes session-key formatting
+ * could collapse multiple agents' memory namespaces into a single "main"
+ * pool without anyone noticing — a privacy/isolation regression that's hard
+ * to debug after the fact.
+ *
+ * An ABSENT sessionKey (undefined) still resolves to "main" because some
+ * callers (manual ingest scripts, doctor probes) legitimately have no
+ * session and the historical behavior treats those as the default agent.
  */
-function agentIdFromSessionKey(sessionKey: string | undefined): string {
-  if (!sessionKey) {return "main";}
+export function agentIdFromSessionKey(sessionKey: string | undefined): string {
+  if (sessionKey === undefined || sessionKey === "") {return "main";}
   const m = /^agent:([^:]+):/.exec(sessionKey);
-  return m ? m[1] : "main";
+  if (!m) {
+    throw new Error(
+      `[memory-postgres] unrecognised sessionKey shape: ${JSON.stringify(sessionKey)} ` +
+        `(expected 'agent:<agentId>:<sessionId>'). Refusing to fall back to ` +
+        `'main' to avoid silent cross-agent memory leakage.`,
+    );
+  }
+  return m[1];
 }
 
 function pluginConfigOf(cfg: OpenClawConfig): unknown {
@@ -121,7 +139,15 @@ async function setup(config: unknown) {
   });
   // First-time call brings up the schema; subsequent calls are idempotent.
   await migrate(pool);
-  await ensureHnswIndex(pool).catch(() => undefined);
+  // Surface HNSW build failures (see index.ts service start for rationale).
+  await ensureHnswIndex(pool).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[memory-postgres] HNSW index not built (T2 hybrid degrades to seq scan): ${
+        (err as Error).message
+      }`,
+    );
+  });
   const embedding = buildEmbeddingClientFromConfig({
     baseUrl: cfg.embedding.baseUrl,
     model: cfg.embedding.model,

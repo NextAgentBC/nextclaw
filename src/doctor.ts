@@ -111,7 +111,7 @@ async function probeEmbedding(cfg: {
   model: string;
   baseUrl?: string;
   apiKeyEnv?: string;
-  format?: "ollama" | "openai";
+  format?: "ollama" | "openai" | "jina";
   path?: string;
 }): Promise<DoctorProbe> {
   const client: EmbeddingClient = buildEmbeddingClientFromConfig(cfg);

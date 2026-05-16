@@ -118,7 +118,18 @@ export default definePluginEntry({
         try {
           const pool = await getPool(activePoolCfg);
           await migrate(pool);
-          await ensureHnswIndex(pool).catch(() => undefined);
+          // HNSW build can legitimately fail on a fresh install (no embeddings
+          // yet → no known dim → no index). It can also fail in ways that
+          // silently degrade T2 hybrid recall to seq scan (pgvector version
+          // mismatch, OOM during build, etc). Surface either reason — the
+          // first case is informational, the second is the user's only signal.
+          await ensureHnswIndex(pool).catch((err) =>
+            api.logger.warn(
+              `memory-postgres: HNSW index not built (T2 hybrid will fall back to seq scan): ${
+                (err as Error).message
+              }`,
+            ),
+          );
         } catch (err) {
           api.logger.warn(
             `memory-postgres: schema migrate failed (will retry on first op): ${(err as Error).message}`,

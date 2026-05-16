@@ -12,14 +12,30 @@ export type MemoryPostgresConfig = {
     poolMax?: number;
     statementTimeoutMs?: number;
   };
-  embedding: {
-    provider: string;
-    model: string;
+  /**
+   * Embedding endpoint block. Optional — when omitted, defaults to Jina's
+   * free tier (`format=jina`, `model=jina-embeddings-v3`, baseUrl
+   * `https://api.jina.ai`, apiKeyEnv `JINA_API_KEY`). New users only need
+   * to grab a key from jina.ai and `export JINA_API_KEY=...` to get going.
+   */
+  embedding?: {
+    provider?: string;
+    model?: string;
     baseUrl?: string;
     apiKeyEnv?: string;
     dims?: number;
-    /** "ollama" | "openai" — wire format. Default ollama. */
-    format?: "ollama" | "openai";
+    /**
+     * "jina" | "openai" | "ollama" — wire format. Default `jina`.
+     * - `jina`   posts `/v1/embeddings` with `{model, input, task}` where
+     *   `task` is `retrieval.passage` for ingest and `retrieval.query` for
+     *   recall (asymmetric retrieval). Use with Jina's free tier as the
+     *   no-setup default.
+     * - `openai` posts `/v1/embeddings` with `{model, input}` — works with
+     *   OpenAI, vLLM, TEI, Together, any compat endpoint.
+     * - `ollama` posts `/api/embed` with `{model, input}` (input gets a
+     *   qwen3 instruct prefix on the query side).
+     */
+    format?: "ollama" | "openai" | "jina";
     /** Optional override for the embed POST path. */
     path?: string;
     /**
@@ -180,7 +196,7 @@ export type ResolvedMemoryPostgresConfig = {
     baseUrl?: string;
     apiKeyEnv?: string;
     dims?: number;
-    format?: "ollama" | "openai";
+    format?: "ollama" | "openai" | "jina";
     path?: string;
     maxEmbedChars: number;
   };
@@ -267,10 +283,17 @@ export function validateConfig(raw: unknown): asserts raw is MemoryPostgresConfi
   const pg = (raw as MemoryPostgresConfig).postgres;
   if (!isObject(pg)) {throw new Error("config.postgres: required");}
   if (!isString(pg.url)) {throw new Error("config.postgres.url: required string");}
+  // embedding block is optional in 0.2+ — omitting it implies the Jina free-tier
+  // defaults (format=jina, model=jina-embeddings-v3, JINA_API_KEY env). When
+  // present, only the format field is constrained; provider+model are filled
+  // in by resolveConfig() based on format.
   const em = (raw as MemoryPostgresConfig).embedding;
-  if (!isObject(em)) {throw new Error("config.embedding: required");}
-  if (!isString(em.provider)) {throw new Error("config.embedding.provider: required string");}
-  if (!isString(em.model)) {throw new Error("config.embedding.model: required string");}
+  if (em !== undefined && !isObject(em)) {
+    throw new Error("config.embedding: must be object when present");
+  }
+  if (em && em.format && !["jina", "openai", "ollama"].includes(em.format)) {
+    throw new Error(`config.embedding.format: must be one of jina|openai|ollama, got ${em.format}`);
+  }
 }
 
 export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgresConfig {
@@ -287,16 +310,7 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
       poolMax: num(raw.postgres.poolMax, 8),
       statementTimeoutMs: num(raw.postgres.statementTimeoutMs, 30_000),
     },
-    embedding: {
-      provider: raw.embedding.provider,
-      model: raw.embedding.model,
-      baseUrl: raw.embedding.baseUrl,
-      apiKeyEnv: raw.embedding.apiKeyEnv,
-      dims: raw.embedding.dims,
-      format: raw.embedding.format,
-      path: raw.embedding.path,
-      maxEmbedChars: Math.max(100, num(raw.embedding.maxEmbedChars, 2000)),
-    },
+    embedding: resolveEmbeddingConfig(raw.embedding),
     tiers: {
       t0SizeLimit: num(tiers.t0SizeLimit, 50),
       t1SizeLimit: num(tiers.t1SizeLimit, 500),
@@ -338,6 +352,54 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
     gitWatchers: (raw.gitWatchers ?? []).map(resolveGitWatcher),
     transcriptWatchers: (raw.transcriptWatchers ?? []).map(resolveTranscriptWatcher),
     shadowComparators: (raw.shadowComparators ?? []).map(resolveShadowComparator),
+  };
+}
+
+/**
+ * Per-format embedding defaults. Picking a format alone (e.g. `{format: "ollama"}`)
+ * is enough to get a working setup; baseUrl/model/apiKeyEnv all fall through to
+ * the per-format default. The frictionless 0→1 case is empty `{}` (or omitting
+ * the block entirely) → Jina free tier with JINA_API_KEY.
+ */
+const EMBEDDING_DEFAULTS: Record<
+  "jina" | "openai" | "ollama",
+  { provider: string; model: string; baseUrl: string; apiKeyEnv?: string }
+> = {
+  jina: {
+    provider: "jina",
+    model: "jina-embeddings-v3",
+    baseUrl: "https://api.jina.ai",
+    apiKeyEnv: "JINA_API_KEY",
+  },
+  openai: {
+    provider: "openai",
+    model: "text-embedding-3-small",
+    baseUrl: "https://api.openai.com",
+    apiKeyEnv: "OPENAI_API_KEY",
+  },
+  ollama: {
+    provider: "ollama",
+    model: "qwen3-embedding:4b",
+    baseUrl: "http://127.0.0.1:11434",
+    // ollama is LAN by default; no api key
+  },
+};
+
+function resolveEmbeddingConfig(
+  raw: NonNullable<MemoryPostgresConfig["embedding"]> | undefined,
+): ResolvedMemoryPostgresConfig["embedding"] {
+  const block = raw ?? {};
+  const format = (block.format ?? "jina") as keyof typeof EMBEDDING_DEFAULTS;
+  const defaults = EMBEDDING_DEFAULTS[format] ?? EMBEDDING_DEFAULTS.jina;
+  return {
+    provider: isString(block.provider) ? block.provider : defaults.provider,
+    model: isString(block.model) ? block.model : defaults.model,
+    baseUrl: isString(block.baseUrl) ? block.baseUrl : defaults.baseUrl,
+    apiKeyEnv: isString(block.apiKeyEnv) ? block.apiKeyEnv : defaults.apiKeyEnv,
+    dims: block.dims,
+    format,
+    path: block.path,
+    maxEmbedChars: Math.max(100, num(block.maxEmbedChars, 2000)),
   };
 }
 

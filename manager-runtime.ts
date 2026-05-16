@@ -77,7 +77,19 @@ async function getOrCreateBundle(cfg: OpenClawConfig): Promise<Bundle> {
 
   // Try to bring up the HNSW index now if dims already known; otherwise the
   // first manager.search() will probe and migrate() will pick it up next time.
-  await ensureHnswIndex(pool).catch(() => undefined);
+  // We do NOT swallow this silently — a failed HNSW build on a populated
+  // database means T2 hybrid recall silently falls back to seq scan, which
+  // is the kind of perf regression users only notice when latency goes from
+  // 250ms to multi-second. Logging keeps the failure observable without
+  // bringing down the rest of the plugin.
+  await ensureHnswIndex(pool).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[memory-postgres] HNSW index not built (T2 hybrid degrades to seq scan): ${
+        (err as Error).message
+      }`,
+    );
+  });
 
   const bundle: Bundle = { pool, embedding, manager, cfg: resolved, poolCfg };
   bundles.set(key, bundle);
