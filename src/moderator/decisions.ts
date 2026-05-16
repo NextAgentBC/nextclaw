@@ -39,6 +39,10 @@ Picking rules:
   • Speaker states durable fact ("我是初二的") → write-only
   • Group chatter, no mention → ignore
   • "我不懂" x3 OR "找老师" → escalate
+  • Vague follow-up (e.g. "research", "再查一下", "上网看看") with
+    no noun phrase → inherit the most recent prior user question's
+    topic; answer-direct against THAT topic. Only clarify if no
+    recent question exists.
   • Intent unclear → clarify
 
 memoryWrites scope: "user" = about speaker, "chat" = about this room,

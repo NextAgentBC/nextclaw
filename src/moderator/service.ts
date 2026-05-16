@@ -491,15 +491,19 @@ function ensureUserFacingReply(decision: import("./types.js").ModeratorDecision)
   if (hasUserFacing) {return;}
   let text: string;
   if (decision.action === "clarify") {
-    // Strip "the bot needs..." / "the user's ..." model-talk; if rationale
-    // is empty or model-meta, fall back to a generic Chinese prompt.
-    const r = decision.rationale?.trim() ?? "";
-    text = r.length > 0 && r.length < 280
-      ? `能不能再说具体一点？${r}`
-      : "能不能再说具体一点？我不太确定你想问什么。";
+    // Never echo the model's rationale verbatim — it's English model-meta
+    // like "The user is instructing the bot to..." which leaks into the
+    // Chinese reply. Keep this generic and Chinese. The Moderator can
+    // emit a richer custom clarify message via telegramActions if it
+    // wants; this is the last-resort backstop.
+    text = "能不能再说具体一点？我没看懂你想问什么。";
   } else {
+    // For escalate the summary is usually clean enough to surface, but
+    // still gate on it being non-English-model-meta. Strict ASCII-only
+    // summary → suppress to generic.
     const sum = decision.escalation?.summary?.trim() ?? "";
-    text = sum.length > 0
+    const isAscii = sum.length > 0 && /^[\x00-\x7F]+$/.test(sum);
+    text = sum.length > 0 && !isAscii
       ? `这个问题我先转给人工：${sum}`
       : "这个问题超出我能处理的范围，已转给人工。";
   }

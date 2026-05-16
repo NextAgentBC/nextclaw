@@ -469,6 +469,38 @@ export async function runWorkersForDecision(
 const CACHE_TTL_DAYS_DEFAULT = 90;
 
 /**
+ * Heuristics for "the worker said it doesn't know". We must NOT write
+ * these to cache.qa — otherwise the L2 semantic precheck happily serves
+ * "I don't know" forever to anyone asking a similar question, blocking
+ * the worker (and thus web_search) from ever running again. This bug
+ * was seen live: an "openclaw latest update" question got cached as
+ * "记忆里没有信息" → next semantically-close question hit that row at
+ * sim=0.95 and the user got the stale non-answer.
+ *
+ * The patterns intentionally err on the side of OVER-rejecting (better
+ * to cache nothing than to cache a non-answer). Real answers that
+ * legitimately contain "我不知道" as part of a longer response (rare)
+ * will be skipped — that's acceptable.
+ */
+const NON_ANSWER_PATTERNS: RegExp[] = [
+  /没有.{0,20}(信息|记录|资料|内容|结果)/,
+  /(知识库|记忆|材料|历史).{0,8}(没有|不包含|找不到)/,
+  /(暂无|没找到|查不到|没有找到|未找到).{0,20}/,
+  /(无法|不能).{0,10}提供.{0,20}/,
+  /我不知道|不太清楚|无从得知/,
+  /\bI (don'?t|do not) (know|have)\b/i,
+  /\b(no|not) (information|data|results?) (available|found)\b/i,
+  /\bcannot (provide|find|access)\b/i,
+];
+
+function looksLikeNonAnswer(text: string): boolean {
+  const t = text.trim();
+  // Very short replies are likely non-answers ("不知道。" / "Unknown").
+  if (t.length < 12) {return true;}
+  return NON_ANSWER_PATTERNS.some((p) => p.test(t));
+}
+
+/**
  * Persist a successful worker answer into cache.qa so the next equivalent
  * question hits the pre-check. Fire-and-forget — failure is logged but
  * doesn't block the user reply.
@@ -484,6 +516,13 @@ export async function writeAnswerToCache(
   task: AnswerTask,
 ): Promise<string | null> {
   if (!result.ok || !result.answer || result.answer.length < 2) {return null;}
+  // Don't cache non-answers — see NON_ANSWER_PATTERNS rationale above.
+  if (looksLikeNonAnswer(result.answer)) {
+    deps.logger.info(
+      `worker[${result.taskId}]: skipping cache write — answer looks like a non-answer`,
+    );
+    return null;
+  }
   try {
     // Embed the CLEANED question (matches what precheck.ts hashes/embeds).
     // taskPrefix: null — we're embedding the *question* as a passage for
