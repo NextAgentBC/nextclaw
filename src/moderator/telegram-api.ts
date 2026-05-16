@@ -19,8 +19,27 @@
  * still get 429, Telegram's `Retry-After` is honoured.
  */
 
+import { lookup as dnsLookup } from "node:dns";
+import { Agent, fetch as undiciFetch } from "undici";
+
 const DEFAULT_API_ROOT = "https://api.telegram.org";
 const DEFAULT_TIMEOUT_MS = 15_000;
+
+/**
+ * Custom undici Agent: IPv4-only on hosts where IPv6 → api.telegram.org
+ * is broken (e.g. our Oracle Cloud setup — same workaround openclaw
+ * does for its own Telegram polling via OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY).
+ * globalThis.fetch in Node 22 honours autoSelectFamily=true by default,
+ * which silently hangs on IPv6-broken hosts. Forcing autoSelectFamily=false
+ * + ipv4-only DNS lookup keeps us on the working path.
+ */
+const ipv4FirstAgent = new Agent({
+  connect: {
+    autoSelectFamily: false,
+    lookup: (hostname, opts, cb) =>
+      dnsLookup(hostname, { ...opts, family: 4, all: false }, cb),
+  },
+});
 
 export type TelegramBotConfig = {
   /** The bot token (channels.telegram.botToken from openclaw.json). */
@@ -67,7 +86,17 @@ export class TelegramBotApi {
   constructor(private readonly cfg: TelegramBotConfig) {
     if (!cfg.botToken) {throw new Error("[moderator] telegram bot token missing");}
     this.apiRoot = (cfg.apiRoot ?? DEFAULT_API_ROOT).replace(/\/+$/, "");
-    this.fetchImpl = cfg.fetchImpl ?? globalThis.fetch;
+    // Use the IPv4-first undici fetch wrapper for production; fall through
+    // to caller-provided override (tests) or globalThis.fetch (other hosts
+    // where IPv6 actually works).
+    // Cross-cast through `unknown` once: undici's Request type and Node lib's
+    // RequestInfo aren't structurally identical (different RequestInit shapes)
+    // but at runtime they're the same. Return type also cast back to Response.
+    this.fetchImpl = cfg.fetchImpl ?? (((url: unknown, init: unknown) =>
+      undiciFetch(
+        url as Parameters<typeof undiciFetch>[0],
+        { ...(init as Parameters<typeof undiciFetch>[1]), dispatcher: ipv4FirstAgent },
+      ) as unknown as Promise<Response>) as unknown as typeof fetch);
     this.timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
@@ -125,7 +154,12 @@ export class TelegramBotApi {
         retryAfter: json.parameters?.retry_after,
       };
     } catch (err) {
-      return { ok: false, error: (err as Error).message };
+      // `fetch failed` is unhelpful on its own — include the cause chain
+      // when available so we can tell DNS / TLS / connect-refused apart
+      // from a 4xx body parse.
+      const e = err as Error & { cause?: unknown };
+      const cause = e.cause ? ` (cause: ${(e.cause as Error)?.message ?? String(e.cause)})` : "";
+      return { ok: false, error: `${e.message}${cause}` };
     } finally {
       clearTimeout(timer);
     }

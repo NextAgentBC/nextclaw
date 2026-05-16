@@ -159,7 +159,11 @@ function serialiseStateForPrompt(state: ModeratorState, knownRoles: string[]): s
       const text = m.text.length > MAX_MESSAGE_TEXT_LEN ? `${m.text.slice(0, MAX_MESSAGE_TEXT_LEN)}…` : m.text;
       const addr = m.isAddressed ? "@" : " ";
       const label = m.fromLabel ? `${m.fromUserId}/${m.fromLabel}` : m.fromUserId;
-      lines.push(`  ${addr} [${m.ts.slice(11, 19)}] ${label}: ${text}`);
+      // Defensive: ts SHOULD be ISO string (service.ts coerces) but
+      // resist crashing on a non-string from a deserialised state row.
+      const tsStr = typeof m.ts === "string" ? m.ts : String(m.ts);
+      const hhmmss = tsStr.length >= 19 ? tsStr.slice(11, 19) : tsStr;
+      lines.push(`  ${addr} [${hhmmss}] ${label}: ${text}`);
     }
   }
 

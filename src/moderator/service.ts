@@ -250,7 +250,10 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
       const messageThreadId = toIntOrUndef(event.metadata?.threadId ?? event.threadId);
       const messageId = toIntOrUndef(event.messageId);
       const message: RecentMessage = {
-        ts: event.timestamp ?? new Date().toISOString(),
+        // event.timestamp may arrive as ISO string, Date, or unix number
+        // depending on the channel. Normalise to ISO string so all later
+        // formatting (which calls `ts.slice`) is type-safe.
+        ts: coerceIsoString(event.timestamp),
         fromUserId: senderUserId,
         fromLabel: event.metadata?.senderName ?? event.metadata?.senderUsername,
         text,
@@ -310,6 +313,17 @@ function inferChatTypeFromId(rawChatId: string): "private" | "group" | "supergro
 function looksAddressed(text: string, isGroup: boolean): boolean {
   if (!isGroup) {return true;} // DMs are always addressed
   return /@\w+_bot|@bot\b|^\/(start|ask|help)/i.test(text);
+}
+
+function coerceIsoString(v: unknown): string {
+  if (typeof v === "string" && v.length > 0) {return v;}
+  if (v instanceof Date) {return v.toISOString();}
+  if (typeof v === "number" && Number.isFinite(v)) {
+    // Telegram delivers unix seconds; multiply if it looks like seconds.
+    const ms = v < 10_000_000_000 ? v * 1000 : v;
+    return new Date(ms).toISOString();
+  }
+  return new Date().toISOString();
 }
 
 function toIntOrUndef(v: string | number | undefined | null): number | undefined {
