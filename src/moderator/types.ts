@@ -130,6 +130,24 @@ export type AnswerTask = {
   /** Whether this task can run in parallel with others in the same decision.
    *  Default true; false means it depends on a prior task's result. */
   canParallel?: boolean;
+  /**
+   * Optional inline specialist spec. When set AND `roleKey` is not yet
+   * registered in `moderator.worker_roles`, the Moderator auto-creates
+   * the row before dispatching. Subsequent decisions reusing the same
+   * `roleKey` get the persisted spec — so the Moderator's choice of
+   * specialist designs accumulates over time, instead of every novel
+   * `roleKey` collapsing back to DEFAULT_ROLE.
+   *
+   * This is the "leverage" hook: stronger Moderator → better specialist
+   * designs → richer permanent registry.
+   *
+   * Operator-seeded rows always win; agent-created rows are first-write-wins.
+   */
+  newRoleSpec?: {
+    systemPrompt: string;
+    displayName?: string;
+    memoryScope?: { topic?: string; kind?: string };
+  };
 };
 
 export type TelegramAction =
@@ -226,13 +244,32 @@ export function parseDecision(raw: unknown): { decision: ModeratorDecision; erro
         const roleKey = typeof t.roleKey === "string" ? t.roleKey : null;
         const taskPrompt = typeof t.taskPrompt === "string" ? t.taskPrompt : null;
         if (!taskId || !roleKey || !taskPrompt) {return null;}
-        return {
+        const out: AnswerTask = {
           taskId,
           roleKey,
           taskPrompt,
           memoryScope: isObj(t.memoryScope) ? (t.memoryScope as AnswerTask["memoryScope"]) : undefined,
           canParallel: t.canParallel !== false,
         };
+        // Optional inline role spec — model declares a new specialist on the fly.
+        // We only accept a usable systemPrompt; everything else is shaped down.
+        if (isObj(t.newRoleSpec)) {
+          const ns = t.newRoleSpec;
+          const sp = typeof ns.systemPrompt === "string" ? ns.systemPrompt.trim() : "";
+          if (sp.length >= 20 && sp.length <= 4000) {
+            out.newRoleSpec = {
+              systemPrompt: sp,
+              displayName: typeof ns.displayName === "string" ? ns.displayName.slice(0, 80) : undefined,
+              memoryScope: isObj(ns.memoryScope)
+                ? {
+                    topic: typeof ns.memoryScope.topic === "string" ? ns.memoryScope.topic : undefined,
+                    kind: typeof ns.memoryScope.kind === "string" ? ns.memoryScope.kind : undefined,
+                  }
+                : undefined,
+            };
+          }
+        }
+        return out;
       })
       .filter((t): t is AnswerTask => t !== null);
   }

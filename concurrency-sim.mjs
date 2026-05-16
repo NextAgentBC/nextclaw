@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import { buildEmbeddingClientFromConfig } from "./dist/src/embedding/client.js";
 import { buildModeratorLlm } from "./dist/src/moderator/llm-client.js";
 import { tryCachePrecheck, clearL0Cache, l0Stats } from "./dist/src/moderator/cache-precheck.js";
-import { dispatchWorker, writeAnswerToCache } from "./dist/src/moderator/workers.js";
+import { dispatchWorker, writeAnswerToCache, loadRoleSpec, upsertWorkerRole } from "./dist/src/moderator/workers.js";
 import { storeCachedAnswer } from "./dist/src/cache/qa.js";
 
 const PG_URL = "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw";
@@ -168,7 +168,7 @@ async function scenarioE_workerRoundtrip() {
 
   const t0 = Date.now();
   const results = await Promise.all(
-    tasks.map((t) => dispatchWorker(wkDeps, t, { userId: "u-test", chatId: "-1003789981008" }, t.taskPrompt)),
+    tasks.map((t) => dispatchWorker(wkDeps, t, { userId: "u-test", chatId: "-1003789981008" }, t.taskPrompt, SCOPE)),
   );
   const dispatchWall = Date.now() - t0;
   console.log(`  5 parallel dispatches: wall=${dispatchWall}ms, individual latencies=${results.map((r) => r.llm.latencyMs).join("/")}ms`);
@@ -197,6 +197,50 @@ async function scenarioE_workerRoundtrip() {
   }
 }
 
+async function scenarioF_roleAutoRegister() {
+  console.log("\n=== F. Role auto-register — Moderator-coined role persists across calls ===");
+  const uid = randomUUID().slice(0, 6);
+  const roleKey = `sim_specialist_${uid}`;
+  const spec = {
+    systemPrompt: `你是一个 [${uid}] 测试 specialist：用 8 个字以内回答任何问题，结尾加 [${uid}] 标签。`,
+    displayName: `Sim Specialist ${uid}`,
+    memoryScope: { topic: "sim.role-register" },
+  };
+
+  // 1. Initial state: role does not exist → loadRoleSpec returns DEFAULT_ROLE
+  const before = await loadRoleSpec(pool, AGENT, roleKey);
+  console.log(`  before insert: roleKey=${before.roleKey} displayName='${before.displayName}' isDefault=${before.systemPrompt === (await loadRoleSpec(pool, AGENT, "__nonexistent__")).systemPrompt}`);
+
+  // 2. RACE: 5 parallel upsert attempts for the SAME brand-new key.
+  //    ON CONFLICT DO NOTHING → exactly one should report `created=true`.
+  const created = await Promise.all(
+    Array.from({ length: 5 }, () => upsertWorkerRole(pool, AGENT, roleKey, spec, SCOPE)),
+  );
+  const successes = created.filter(Boolean).length;
+  console.log(`  5 parallel upserts: created=${successes}/5 (expect exactly 1)`);
+
+  // 3. Subsequent loadRoleSpec must return the Moderator-designed spec, NOT default.
+  const after = await loadRoleSpec(pool, AGENT, roleKey);
+  const usesNewSpec = after.systemPrompt === spec.systemPrompt;
+  console.log(`  after upsert: roleKey=${after.roleKey} displayName='${after.displayName}'`);
+  console.log(`  systemPrompt matches spec: ${usesNewSpec ? "✓" : "✗ — DEFAULT_ROLE was returned"}`);
+
+  // 4. Second upsert with a DIFFERENT prompt under the same key → must be ignored (first-write-wins).
+  const overwriteAttempted = await upsertWorkerRole(
+    pool,
+    AGENT,
+    roleKey,
+    { ...spec, systemPrompt: "覆盖测试 — 不该出现", displayName: "should not stick" },
+    SCOPE,
+  );
+  const final = await loadRoleSpec(pool, AGENT, roleKey);
+  console.log(`  second upsert returned created=${overwriteAttempted} (expect false)`);
+  console.log(`  systemPrompt still original: ${final.systemPrompt === spec.systemPrompt ? "✓ first-write-wins" : "✗ overwritten"}`);
+
+  // Cleanup.
+  await pool.query("DELETE FROM moderator.worker_roles WHERE agent_id=$1 AND role_key=$2", [AGENT, roleKey]);
+}
+
 async function main() {
   console.log("Concurrency simulation — Moderator cache + worker pipeline");
   console.log("==========================================================");
@@ -206,6 +250,7 @@ async function main() {
     await scenarioC_viewerIsolation();
     await scenarioD_mixed();
     await scenarioE_workerRoundtrip();
+    await scenarioF_roleAutoRegister();
   } finally {
     await pool.end();
   }
