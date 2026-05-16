@@ -173,11 +173,16 @@ export async function loadRoleSpec(
   if (!row) {
     return { ...DEFAULT_ROLE, roleKey }; // keep the requested key for traceability
   }
-  // "tools=[]" means "inherit DEFAULT tools" — most stored role rows
-  // pre-date the tool runtime. Roles wanting strictly zero tools should
-  // register with ['__none__'] which the registry filters back to [].
+  // Tool resolution: DEFAULT_ROLE.tools is the FLOOR. Stored tools can
+  // ADD specialized tools (kb_lookup, escalate_to_human, ...) but cannot
+  // strip the baseline kit. This was learned the hard way: a Moderator-
+  // coined `general_knowledge_explainer` role wrote `tools=['memory_search']`
+  // (no web_search) and the worker then replied "I cannot browse the
+  // internet" to a research question — even though the runtime had the
+  // tool registered. By unioning, we guarantee web_search is always at
+  // least available; the model still decides whether to call it.
   const storedTools = row.tools ?? [];
-  const effectiveTools = storedTools.length === 0 ? [...DEFAULT_ROLE.tools] : storedTools;
+  const effectiveTools = Array.from(new Set([...DEFAULT_ROLE.tools, ...storedTools]));
   return {
     roleKey: row.role_key,
     displayName: row.display_name ?? row.role_key,
@@ -307,13 +312,30 @@ export async function dispatchWorker(
   //   - No tools allowlisted → single-shot (current behavior, zero regression)
   //   - Tools available     → one round of tool-call → execute → final answer
   const tools = resolveTools(role.tools);
+  // Every role gets this baseline guidance prepended to its systemPrompt.
+  // The role's own prompt drives persona / voice / scope — this just
+  // ensures every worker, regardless of who designed the role, knows to:
+  //   1. match the user's language (the Moderator sometimes coins roles
+  //      with English systemPrompts → workers replied in English to
+  //      Chinese users)
+  //   2. use web_search for current/time-sensitive info (a sloppy
+  //      Moderator-coined role might forget to mention this)
+  //   3. use memory_search for prior-conversation references
+  // ~70 tokens overhead per worker call — cheap compared to a wrong answer.
+  const WORKER_BASELINE_PREAMBLE =
+    "回答时遵守以下基线规则：\n" +
+    "1) 用用户提问使用的语言回答（中文问题用中文，英文问题用英文）。\n" +
+    "2) 问到实时/最新信息（新闻、版本号、当前状态、最近更新）时主动用 web_search 工具，别说『我无法上网』。\n" +
+    "3) 问到本群历史或已建立的事实时用 memory_search。\n\n" +
+    "---\n\n";
+  const effectiveSystemPrompt = WORKER_BASELINE_PREAMBLE + role.systemPrompt;
   const totals = { inputTokens: 0, outputTokens: 0, model: undefined as string | undefined };
   const startLatency = Date.now();
   let toolCallsExecuted: ToolCall[] = [];
 
   if (tools.length === 0) {
     // ----- single-shot path -----
-    const res = await chatSingle(deps.workerLlm, role.systemPrompt, userPrompt, WORKER_MAX_OUTPUT_TOKENS);
+    const res = await chatSingle(deps.workerLlm, effectiveSystemPrompt, userPrompt, WORKER_MAX_OUTPUT_TOKENS);
     if (!res.ok) {
       return failureResult(task, role, cleanedQ, topicTag, recallCount, res.error);
     }
@@ -325,7 +347,7 @@ export async function dispatchWorker(
 
   // ----- tool-call path: one round max -----
   const turn1 = await deps.workerLlm.chat({
-    systemPrompt: role.systemPrompt,
+    systemPrompt: effectiveSystemPrompt,
     history: [{ role: "user", text: userPrompt }],
     tools,
     maxOutputTokens: WORKER_MAX_OUTPUT_TOKENS,
@@ -363,7 +385,7 @@ export async function dispatchWorker(
     turn1.toolCalls,
   );
   const turn2 = await deps.workerLlm.chat({
-    systemPrompt: role.systemPrompt,
+    systemPrompt: effectiveSystemPrompt,
     history: [
       { role: "user", text: userPrompt },
       ...exportToolResultsAsHistory(turn1.toolCalls, toolResults),
@@ -490,7 +512,10 @@ const NON_ANSWER_PATTERNS: RegExp[] = [
   /我不知道|不太清楚|无从得知/,
   /\bI (don'?t|do not) (know|have)\b/i,
   /\b(no|not) (information|data|results?) (available|found)\b/i,
-  /\bcannot (provide|find|access)\b/i,
+  /\bcannot (provide|find|access|fulfill|browse|search|help)\b/i,
+  /\bI(?:'?m|\s+am)\s+sorry,?\s+but\b/i,
+  /\b(unable to|not able to)\s+(browse|search|access|fulfill|provide)\b/i,
+  /\bmy (current )?capabilities? (do not|don'?t) allow\b/i,
 ];
 
 function looksLikeNonAnswer(text: string): boolean {
