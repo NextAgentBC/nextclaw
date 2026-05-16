@@ -32,6 +32,7 @@ import { runOneCycle, type ModeratorLlm } from "./runner.js";
 import { executeDecision } from "./side-effects.js";
 import { TelegramBotApi } from "./telegram-api.js";
 import type { RecentMessage } from "./types.js";
+import { runWorkersForDecision, writeAnswerToCache } from "./workers.js";
 
 export type ModeratorServiceConfig = {
   enabled: boolean;
@@ -240,14 +241,75 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
         logger: config.logger,
       });
 
-      // 5. Splice placeholder message_ids back into activeWorkers (so
-      //    edit_placeholder works when workers complete in Phase D).
+      // 5. Splice placeholder message_ids back into activeWorkers.
       const updatedState = { ...out.state };
       if (fx.placeholders.length > 0) {
         updatedState.activeWorkers = updatedState.activeWorkers.map((w) => {
           const ph = fx.placeholders.find((p) => p.taskId === w.taskId);
           return ph ? { ...w, placeholderMessageId: ph.messageId } : w;
         });
+      }
+
+      // 5.5. Phase D — dispatch workers, edit placeholders with answers,
+      //      write answers back to cache.qa.
+      const tasks = out.decision.answerTasks ?? [];
+      if (tasks.length > 0) {
+        const wkDeps = {
+          pool: config.pool,
+          llm: config.llm,
+          embedding: config.embedding,
+          cfg: config.cfg,
+          agentId: "main",
+          logger: config.logger,
+        };
+        const viewer = { userId: senderUserId, chatId };
+        const results = await runWorkersForDecision(wkDeps, tasks, viewer, trigger.text);
+        for (const r of results) {
+          // Find the placeholder message_id for this task: first try
+          // fx.placeholders (this cycle), fall back to activeWorkers
+          // (in case Phase E adds across-cycle workers).
+          const phMessageId =
+            fx.placeholders.find((p) => p.taskId === r.taskId)?.messageId ??
+            updatedState.activeWorkers.find((w) => w.taskId === r.taskId)?.placeholderMessageId ??
+            null;
+          if (phMessageId) {
+            const editRes = await tg.editMessageText({
+              chatId,
+              messageId: phMessageId,
+              text: r.answer.slice(0, 4000), // Telegram cap
+            });
+            if (!editRes.ok) {
+              config.logger.warn(`moderator: edit_placeholder task=${r.taskId} failed: ${editRes.error}`);
+            }
+          } else if (r.ok) {
+            // No placeholder existed — send the answer as a fresh message.
+            await tg.sendMessage({ chatId, text: r.answer.slice(0, 4000), messageThreadId });
+          }
+          // Mark the worker done in state.
+          updatedState.activeWorkers = updatedState.activeWorkers.map((w) =>
+            w.taskId === r.taskId
+              ? { ...w, status: r.ok ? "completed" : "failed", result: r.answer.slice(0, 200) }
+              : w,
+          );
+          // Cache write-back (fire-and-forget — never block the reply).
+          if (r.ok) {
+            const task = tasks.find((t) => t.taskId === r.taskId);
+            if (task) {
+              void writeAnswerToCache(wkDeps, r, task).then((id) => {
+                if (id) {
+                  config.logger.info(
+                    `moderator: scope=${scopeKey} cached answer id=${id} task=${r.taskId} topic=${r.topicTag ?? "-"}`,
+                  );
+                }
+              });
+            }
+          }
+          config.logger.info(
+            `moderator: worker task=${r.taskId} role=${r.roleKey} ok=${r.ok} ` +
+              `tokens=${r.llm.inputTokens ?? "?"}→${r.llm.outputTokens ?? "?"} ` +
+              `latency=${r.llm.latencyMs ?? "?"}ms recall=${r.recallCount}`,
+          );
+        }
       }
 
       // 6. Save state. If escalation asked to pause the scope, flip status.
