@@ -38,6 +38,7 @@ import {
 import { categorize } from "../structured/categorizer.js";
 import { inferTimeBucketsFromQuery } from "./temporal.js";
 import type { RecallContext, RouteName } from "./types.js";
+import { filterVisibleChunkIds, type ViewerScope } from "./viewer-scope.js";
 import { primeWorkingSetWithProfiles, workingSetFor } from "./working-set.js";
 
 /* ----------------------- query-side anchor inference ---------------------- */
@@ -127,6 +128,17 @@ export type RecallInput = {
    * the owner's private chunks even if it tries. Default 'main' for back-compat.
    */
   agentId?: string;
+  /**
+   * Viewer scope. When set, the merged result set is passed through
+   * `filterVisibleChunkIds` to enforce the three-tier (per-user-global /
+   * per-chat-shared / per-(chat,user)) memory privacy model. See
+   * `src/recall/viewer-scope.ts` for the rules.
+   *
+   * - For DM recalls: pass `viewer.userId` only.
+   * - For group recalls: pass both `viewer.userId` AND `viewer.chatId`.
+   * - For system / migration callers without a human viewer: omit entirely.
+   */
+  viewer?: ViewerScope;
 };
 
 export type RecallOutput = {
@@ -176,6 +188,11 @@ function scopeKeyFor(input: RecallInput): string {
     // Agent id is part of the cache scope so two agents asking the same
     // question against different memory namespaces never share results.
     `agent:${input.agentId ?? "main"}`,
+    // Viewer scope is also part of the cache key — different viewers in
+    // the same agent must see different filtered results (privacy), so
+    // they should NOT share a cache entry even when their query string
+    // matches verbatim. Cuts hit-rate slightly; required for correctness.
+    `viewer:${input.viewer?.userId ?? ""}:${input.viewer?.chatId ?? ""}`,
     a.cwd ?? "",
     a.branch ?? "",
     a.pr ?? "",
@@ -263,7 +280,12 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
   const minScore = input.minScore ?? 0;
   const scope = scopeKeyFor(input);
   const { qHash } = hashQuery(input.query, scope);
-  const ws = workingSetFor(input.agentSessionId, deps.cfg.tiers.t0SizeLimit, input.agentId);
+  const ws = workingSetFor(
+    input.agentSessionId,
+    deps.cfg.tiers.t0SizeLimit,
+    input.agentId,
+    input.viewer?.userId,
+  );
 
   // First recall of a session: prime T0 with this agent's profile chunks
   // (MemGPT-style "core memory" — per-agent + per-entity summaries that
@@ -376,6 +398,7 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
     categories: inferredCategories,
     perRouteK: T2_PER_ROUTE_K,
     agentId: input.agentId ?? "main",
+    viewer: input.viewer,
   };
 
   const [
@@ -477,7 +500,19 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
   }
 
   const reranked = mmrRerank(all, k);
-  const filtered = reranked.filter((c) => c.combinedScore >= minScore);
+  let filtered = reranked.filter((c) => c.combinedScore >= minScore);
+
+  // Three-tier privacy filter: drop any chunk that's not visible to the
+  // current viewer. Cheap single-RT batch lookup. For DM / system callers
+  // who didn't set viewer, this is a no-op pass-through.
+  if (input.viewer && (input.viewer.userId || input.viewer.chatId) && filtered.length > 0) {
+    const visible = await filterVisibleChunkIds(
+      deps.pool,
+      input.viewer,
+      filtered.map((c) => c.chunkId),
+    );
+    filtered = filtered.filter((c) => visible.has(c.chunkId));
+  }
 
   // T1 hot promotion + T0 working set + spreading activation.
   const hitIds = filtered.map((c) => c.chunkId);

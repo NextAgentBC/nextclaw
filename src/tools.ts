@@ -39,6 +39,16 @@ const SEARCH_PARAMS = {
       pattern: "^\\d{4}-\\d{2}-\\d{2}$",
       description: "Optional ISO date YYYY-MM-DD to filter by.",
     },
+    viewerUserId: {
+      type: "string",
+      description:
+        "Advanced. The human asking. In multi-user groups, set this to scope recall to chunks visible to that specific user (per-user-global facts + group-public facts). Auto-derived from session key for DMs.",
+    },
+    viewerChatId: {
+      type: "string",
+      description:
+        "Advanced. The chat the question was asked in (telegram chat id). Used together with viewerUserId for group privacy filtering. Omit for DM.",
+    },
   },
 } as const;
 
@@ -77,7 +87,35 @@ type SearchParams = {
   branch?: string;
   pr?: string;
   timeBucket?: string;
+  viewerUserId?: string;
+  viewerChatId?: string;
 };
+
+/**
+ * Best-effort viewer extraction from session keys.
+ *
+ *   agent:<aid>:telegram:direct:<userId>       → DM, viewer = userId
+ *   agent:<aid>:telegram:group:<chatId>        → group, viewer.chatId only
+ *   agent:<aid>:telegram:group:<chat>:topic:<t> → forum, chatId only
+ *   agent:<aid>:main                            → legacy, no viewer
+ *
+ * Returns undefined fields when the session key doesn't encode them. The
+ * caller (memory_search tool body) merges explicit params on top of these
+ * inferences so Moderator-style callers can override.
+ */
+function viewerFromSessionKey(sessionKey: string | undefined): {
+  userId?: string;
+  chatId?: string;
+} {
+  if (!sessionKey) {return {};}
+  // DM: agent:<aid>:<channel>:direct:<userId>
+  const dm = /^agent:[^:]+:[^:]+:direct:([^:]+)/.exec(sessionKey);
+  if (dm) {return { userId: dm[1] };}
+  // Group: agent:<aid>:<channel>:group:<chatId>(:topic:<t>)?
+  const grp = /^agent:[^:]+:[^:]+:group:([^:]+)/.exec(sessionKey);
+  if (grp) {return { chatId: grp[1] };}
+  return {};
+}
 
 type StoreParams = {
   text: string;
@@ -217,6 +255,12 @@ export function buildSearchTool(args: { config: OpenClawConfig; sessionKey?: str
     async execute(this: void, _toolCallId: string, params: unknown): Promise<{ content: unknown; details: unknown }> {
       const p = params as SearchParams;
       const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+      // Viewer inference: start from session key, let explicit params override.
+      const inferredViewer = viewerFromSessionKey(args.sessionKey);
+      const viewer = {
+        userId: p.viewerUserId ?? inferredViewer.userId,
+        chatId: p.viewerChatId ?? inferredViewer.chatId,
+      };
       const result = await recall(
         { cfg, pool, embedding },
         {
@@ -230,6 +274,9 @@ export function buildSearchTool(args: { config: OpenClawConfig; sessionKey?: str
           timeBucket: p.timeBucket,
           agentSessionId: args.sessionKey,
           agentId: agentIdFromSessionKey(args.sessionKey),
+          // Only attach viewer when we actually have something to filter on;
+          // an empty viewer object signals "no filtering" to the router.
+          viewer: viewer.userId || viewer.chatId ? viewer : undefined,
         },
       );
 

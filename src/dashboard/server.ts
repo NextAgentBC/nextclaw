@@ -255,6 +255,11 @@ async function handleRecall(
   const anchorsRaw = (typeof b["anchors"] === "object" && b["anchors"] !== null && !Array.isArray(b["anchors"]))
     ? (b["anchors"] as Record<string, unknown>)
     : {};
+  const viewerRaw = typeof b["viewer"] === "object" && b["viewer"] !== null && !Array.isArray(b["viewer"])
+    ? (b["viewer"] as Record<string, unknown>)
+    : {};
+  const viewerUserId = asStr(viewerRaw["userId"]);
+  const viewerChatId = asStr(viewerRaw["chatId"]);
   const input: RecallInput = {
     query,
     maxResults: asNum(b["k"]) ?? asNum(b["maxResults"]),
@@ -272,6 +277,9 @@ async function handleRecall(
       scope: asStr(anchorsRaw["scope"]),
     },
     timeBucket: asStr(b["timeBucket"]),
+    viewer: viewerUserId || viewerChatId
+      ? { userId: viewerUserId, chatId: viewerChatId }
+      : undefined,
   };
   const embedding = buildEmbeddingClientFromConfig({
     baseUrl: cfg.embedding.baseUrl,
