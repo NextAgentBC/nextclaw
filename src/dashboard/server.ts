@@ -22,6 +22,14 @@ import { fileURLToPath } from "node:url";
 import type { Pool, PoolClient } from "pg";
 import type { ResolvedMemoryPostgresConfig } from "../config.js";
 import { buildEmbeddingClientFromConfig } from "../embedding/client.js";
+import {
+  cacheStats,
+  invalidateCachedAnswer,
+  lookupCachedAnswer,
+  recordCacheFeedback,
+  recordCacheHit,
+  storeCachedAnswer,
+} from "../cache/qa.js";
 import { ingestOne, type IngestInput } from "../ingest/pipeline.js";
 import { recall as recallFn, type RecallInput } from "../recall/router.js";
 import { readBotStats } from "./bot-stats.js";
@@ -309,6 +317,152 @@ async function handleRecall(
  * populated by the shadow-comparator worker. Returns aggregate stats per
  * challenger model + the recent N turns for the dashboard panel.
  */
+/* ----------------------------- cache.qa routes ---------------------------- */
+
+async function handleCacheLookup(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pool: Pool,
+  cfg: ResolvedMemoryPostgresConfig,
+): Promise<void> {
+  if (req.method !== "POST") {return send(res, 405, "method not allowed", "text/plain");}
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch (err) {
+    return sendJson(res, 400, { ok: false, error: (err as Error).message });
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return sendJson(res, 400, { ok: false, error: "body must be a JSON object" });
+  }
+  const b = body as Record<string, unknown>;
+  const questionText = asStr(b["question"]);
+  if (!questionText) {return sendJson(res, 400, { ok: false, error: "question is required" });}
+
+  const viewerRaw = typeof b["viewer"] === "object" && b["viewer"] !== null && !Array.isArray(b["viewer"])
+    ? (b["viewer"] as Record<string, unknown>) : {};
+  const viewer = {
+    userId: asStr(viewerRaw["userId"]),
+    chatId: asStr(viewerRaw["chatId"]),
+  };
+  const minSim = asNum(b["minSimilarity"]);
+  const topicTag = asStr(b["topicTag"]);
+  const agentId = asStr(b["agentId"]) ?? "main";
+
+  // For semantic path we need an embedding; if caller didn't precompute,
+  // we embed locally using the same embed client the recall path uses.
+  let questionEmbedding: number[] | undefined;
+  if (Array.isArray(b["questionEmbedding"])) {
+    questionEmbedding = b["questionEmbedding"] as number[];
+  } else if (b["embed"] !== false) {
+    const embedClient = buildEmbeddingClientFromConfig({
+      baseUrl: cfg.embedding.baseUrl,
+      model: cfg.embedding.model,
+      apiKeyEnv: cfg.embedding.apiKeyEnv,
+      format: cfg.embedding.format,
+      path: cfg.embedding.path,
+    });
+    const r = await embedClient.embed({ inputs: [questionText.slice(0, cfg.embedding.maxEmbedChars)], taskPrefix: "query" });
+    questionEmbedding = r.embeddings[0];
+  }
+
+  const hit = await lookupCachedAnswer(pool, {
+    agentId,
+    questionText,
+    questionEmbedding,
+    viewer: viewer.userId || viewer.chatId ? viewer : undefined,
+    minSimilarity: minSim,
+    topicTag,
+  });
+  if (hit) {
+    await recordCacheHit(pool, hit.id);
+  }
+  sendJson(res, 200, { ok: true, hit });
+}
+
+async function handleCacheStore(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pool: Pool,
+  cfg: ResolvedMemoryPostgresConfig,
+): Promise<void> {
+  if (req.method !== "POST") {return send(res, 405, "method not allowed", "text/plain");}
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch (err) {
+    return sendJson(res, 400, { ok: false, error: (err as Error).message });
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return sendJson(res, 400, { ok: false, error: "body must be a JSON object" });
+  }
+  const b = body as Record<string, unknown>;
+  const questionText = asStr(b["question"]);
+  const answerText = asStr(b["answer"]);
+  if (!questionText || !answerText) {
+    return sendJson(res, 400, { ok: false, error: "question and answer required" });
+  }
+  const embedClient = buildEmbeddingClientFromConfig({
+    baseUrl: cfg.embedding.baseUrl,
+    model: cfg.embedding.model,
+    apiKeyEnv: cfg.embedding.apiKeyEnv,
+    format: cfg.embedding.format,
+    path: cfg.embedding.path,
+  });
+  const embedRes = await embedClient.embed({ inputs: [questionText.slice(0, cfg.embedding.maxEmbedChars)] });
+  const scopeRaw = typeof b["scope"] === "object" && b["scope"] !== null && !Array.isArray(b["scope"])
+    ? (b["scope"] as Record<string, unknown>) : {};
+  const id = await storeCachedAnswer(pool, {
+    agentId: asStr(b["agentId"]) ?? "main",
+    questionText,
+    questionEmbedding: embedRes.embeddings[0] ?? [],
+    embeddingModel: embedRes.model,
+    answerText,
+    answerFormat: (asStr(b["answerFormat"]) as "plain" | "markdown" | "latex") ?? "plain",
+    scope: {
+      chatId: asStr(scopeRaw["chatId"]),
+      senderId: asStr(scopeRaw["senderId"]),
+      visibility: (asStr(scopeRaw["visibility"]) as "public" | "private" | "chat-only") ?? "public",
+    },
+    topicTag: asStr(b["topicTag"]),
+    source: (asStr(b["source"]) as "agent" | "csv-seed" | "manual") ?? "manual",
+    sourceDocId: asStr(b["sourceDocId"]),
+    ttlDays: asNum(b["ttlDays"]),
+  });
+  sendJson(res, 200, { ok: true, id });
+}
+
+async function handleCacheFeedback(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pool: Pool,
+): Promise<void> {
+  if (req.method !== "POST") {return send(res, 405, "method not allowed", "text/plain");}
+  const body = await readJsonBody(req) as Record<string, unknown>;
+  const id = asStr(body["id"]);
+  const vote = asStr(body["vote"]);
+  if (!id || (vote !== "up" && vote !== "down")) {
+    return sendJson(res, 400, { ok: false, error: "id and vote=up|down required" });
+  }
+  await recordCacheFeedback(pool, id, vote);
+  sendJson(res, 200, { ok: true });
+}
+
+async function handleCacheInvalidate(
+  req: IncomingMessage,
+  res: ServerResponse,
+  pool: Pool,
+): Promise<void> {
+  if (req.method !== "POST") {return send(res, 405, "method not allowed", "text/plain");}
+  const body = await readJsonBody(req) as Record<string, unknown>;
+  const id = asStr(body["id"]);
+  const reason = asStr(body["reason"]) ?? "manual";
+  if (!id) {return sendJson(res, 400, { ok: false, error: "id required" });}
+  await invalidateCachedAnswer(pool, id, reason);
+  sendJson(res, 200, { ok: true });
+}
+
+async function handleCacheStatsRoute(res: ServerResponse, pool: Pool): Promise<void> {
+  const rows = await cacheStats(pool, "main");
+  sendJson(res, 200, { ok: true, byTopic: rows });
+}
+
 async function handleModelCompare(res: ServerResponse, pool: Pool): Promise<void> {
   // Aggregates per challenger model, last 24h.
   const agg = await pool.query(
@@ -544,6 +698,21 @@ export async function startDashboardServer(
           return;
         case "/api/ingest":
           await handleIngest(req, res, pool, cfg);
+          return;
+        case "/api/cache/lookup":
+          await handleCacheLookup(req, res, pool, cfg);
+          return;
+        case "/api/cache/store":
+          await handleCacheStore(req, res, pool, cfg);
+          return;
+        case "/api/cache/feedback":
+          await handleCacheFeedback(req, res, pool);
+          return;
+        case "/api/cache/invalidate":
+          await handleCacheInvalidate(req, res, pool);
+          return;
+        case "/api/cache/stats":
+          await handleCacheStatsRoute(res, pool);
           return;
         default:
           send(res, 404, "not found", "text/plain");
