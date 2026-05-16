@@ -114,69 +114,60 @@ export default definePluginEntry({
       { names: ["memory_forget"] },
     );
 
-    // Moderator event hook — registered as `inbound_claim` (not the older
-    // `message_received` observer) so we can CLAIM the message and prevent
-    // codex's parallel reply on Telegram group @-mentions.
+    // Moderator suppression hook — `before_dispatch` (NOT `inbound_claim`).
     //
-    // Why this is necessary: before this change, the Moderator handled the
-    // group @-mention and replied via direct Telegram API calls, but the
-    // codex per-channel agent ALSO replied because `message_received` is a
-    // fire-and-forget observer and openclaw's dispatcher kept running. The
-    // user saw two answers per group question — one from the Moderator
-    // worker (gemini-flash, no web tools) and one from codex (gpt-5.5 with
-    // tavily). With inbound_claim we return `{handled:true}` to stop
-    // codex's downstream path; DMs are unaffected because we only claim
-    // group/supergroup channels.
-    api.on("inbound_claim", async (event, hookCtx) => {
-      const ctxObj = hookCtx as { channelId?: string; conversationId?: string; senderId?: string };
-      const channelId = ctxObj?.channelId;
-      if (channelId !== "telegram") {return;}
-      if (!MODULE_MODERATOR_HANDLE) {return;}
+    // Why before_dispatch and not inbound_claim:
+    //   - inbound_claim only fires for conversations that have a
+    //     PluginConversationBinding linking the chat to a specific plugin
+    //     (see dispatch-CvimgVpK.js: runInboundClaimForPluginOutcome is
+    //     only called inside `if (pluginOwnedBinding)`). Our telegram
+    //     chats are bound to codex (the default agent), not to
+    //     memory-postgres, so our inbound_claim handler would silently
+    //     never fire — the previous attempt failed exactly here.
+    //   - before_dispatch is unconditional: `if (hookRunner?.hasHooks
+    //     ("before_dispatch"))` then run, no binding required. Returning
+    //     `{handled: true}` short-circuits the dispatcher before codex
+    //     gets the message.
+    //
+    // The companion observer hook below (message_received) is what actually
+    // forwards the inbound event into the Moderator pipeline; before_dispatch
+    // only decides whether to suppress codex.
+    api.on("before_dispatch", async (event, hookCtx) => {
+      const ctxObj = hookCtx as { channelId?: string; conversationId?: string };
+      if (ctxObj?.channelId !== "telegram") {return;}
+      // event.isGroup is set directly by the dispatcher (see
+      // hook-types: PluginHookBeforeDispatchEvent), preferred over
+      // re-parsing the conversation id.
+      const ev = event as { content?: string; isGroup?: boolean };
+      const isGroup = ev.isGroup === true ||
+        (ctxObj.conversationId ?? "")
+          .replace(/^(?:channel:|chat:|user:|tg-?|telegram:|slack:|discord:|whatsapp:)/, "")
+          .startsWith("-");
+      if (!isGroup) {return;} // DMs continue to codex
+      const addressed = /@\w+_bot|@bot\b|^\/(start|ask|help)/i.test(ev.content ?? "");
+      if (!addressed) {return;} // group chatter not for the bot — codex won't reply anyway
+      api.logger.info(
+        `[moderator/hook] before_dispatch CLAIMED: conv=${ctxObj.conversationId} ` +
+          `(group + mention — codex suppressed; Moderator replies out-of-band)`,
+      );
+      return { handled: true };
+    });
 
-      // Always forward to the Moderator so its state machine tracks every
-      // message (it filters DM internally). Construct the
-      // PluginMessageEvent shape the service expects.
-      const mEv = {
-        from: event.senderId,
-        senderId: event.senderId,
-        content: event.content,
-        timestamp: event.timestamp ? new Date(event.timestamp).toISOString() : undefined,
-        threadId: event.threadId,
-        messageId: event.messageId,
-        metadata: {
-          senderName: event.senderName,
-          senderUsername: event.senderUsername,
-          threadId: event.threadId,
-        },
-      };
+    // Observer hook — runs after before_dispatch (whether or not codex was
+    // suppressed) so the Moderator's state machine sees every telegram
+    // event. DM filtering happens inside the service.
+    api.on("message_received", async (event, hookCtx) => {
+      const ctxObj = hookCtx as { channelId?: string };
+      if (ctxObj?.channelId !== "telegram") {return;}
+      if (!MODULE_MODERATOR_HANDLE) {return;}
       try {
         MODULE_MODERATOR_HANDLE.onMessageReceived(
-          mEv as Parameters<ModeratorServiceHandle["onMessageReceived"]>[0],
+          event as Parameters<ModeratorServiceHandle["onMessageReceived"]>[0],
           hookCtx as Parameters<ModeratorServiceHandle["onMessageReceived"]>[1],
         );
       } catch (err) {
-        api.logger.warn(`memory-postgres: moderator inbound_claim hook threw: ${(err as Error).message}`);
+        api.logger.warn(`memory-postgres: moderator message_received hook threw: ${(err as Error).message}`);
       }
-
-      // Decide whether to CLAIM. The rule MUST match the Moderator's own
-      // group-and-addressed filter in service.ts (looksAddressed +
-      // inferChatTypeFromId), otherwise we'd either:
-      //   - claim a DM the Moderator won't actually answer → user silence
-      //   - leave a group mention un-claimed → double reply (the original bug)
-      const conv = (ctxObj.conversationId ?? "").replace(
-        /^(?:channel:|chat:|user:|tg-?|telegram:|slack:|discord:|whatsapp:)/,
-        "",
-      );
-      const isGroup = conv.startsWith("-");
-      if (!isGroup) {return;}
-      const addressed = /@\w+_bot|@bot\b|^\/(start|ask|help)/i.test(event.content ?? "");
-      if (!addressed) {return;}
-
-      api.logger.info(
-        `[moderator/hook] inbound_claim CLAIMED: conv=${ctxObj.conversationId} sender=${ctxObj.senderId} ` +
-          `(group mention — codex skipped)`,
-      );
-      return { handled: true };
     });
 
     /**
