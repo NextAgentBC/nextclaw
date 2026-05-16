@@ -444,9 +444,20 @@ export default definePluginEntry({
                 format: cfg.embedding.format,
                 path: cfg.embedding.path,
               });
+              // Worker LLM: reuses the moderator's model config but routes
+              // through the tool-aware transport (Gemini :generateContent
+              // with tool calls; OpenAI single-shot fallback only).
+              const { buildWorkerLlmFromConfig } = await import("./src/moderator/worker-llm.js");
+              const workerLlm = buildWorkerLlmFromConfig({
+                format: cfg.moderator.model.format,
+                baseUrl: cfg.moderator.model.baseUrl,
+                model: cfg.moderator.model.model,
+                apiKeyEnv: cfg.moderator.model.apiKeyEnv,
+              });
               moderatorHandle = startModeratorService({
                 enabled: true,
                 llm,
+                workerLlm,
                 embedding: embeddingClient,
                 telegramBotToken: botToken,
                 ownerUserId,

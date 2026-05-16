@@ -17,6 +17,7 @@ import { buildEmbeddingClientFromConfig } from "./dist/src/embedding/client.js";
 import { buildModeratorLlm } from "./dist/src/moderator/llm-client.js";
 import { tryCachePrecheck, clearL0Cache, l0Stats } from "./dist/src/moderator/cache-precheck.js";
 import { dispatchWorker, writeAnswerToCache, loadRoleSpec, upsertWorkerRole } from "./dist/src/moderator/workers.js";
+import { buildWorkerLlmFromConfig } from "./dist/src/moderator/worker-llm.js";
 import { storeCachedAnswer } from "./dist/src/cache/qa.js";
 
 const PG_URL = "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw";
@@ -142,7 +143,7 @@ async function scenarioD_mixed() {
 async function scenarioE_workerRoundtrip() {
   console.log("\n=== E. Phase D round-trip — 5 parallel worker dispatches → write-back → cache ===");
   clearL0Cache();
-  const llm = buildModeratorLlm({
+  const workerLlm = buildWorkerLlmFromConfig({
     format: "gemini",
     baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
     model: "gemini-2.5-flash",
@@ -153,7 +154,7 @@ async function scenarioE_workerRoundtrip() {
     embedding: { model: "qwen3-embedding:0.6b" },
   };
   const logger = { info: () => {}, warn: () => {} }; // quiet
-  const wkDeps = { pool, llm, embedding, cfg, agentId: AGENT, logger };
+  const wkDeps = { pool, workerLlm, embedding, cfg, agentId: AGENT, logger };
 
   // 5 *different* novel questions (UUID suffix), so each must call the LLM,
   // then write back. After write-back, a second precheck for each must hit.
@@ -241,6 +242,69 @@ async function scenarioF_roleAutoRegister() {
   await pool.query("DELETE FROM moderator.worker_roles WHERE agent_id=$1 AND role_key=$2", [AGENT, roleKey]);
 }
 
+async function scenarioG_workerTools() {
+  console.log("\n=== G. Worker tool calls — model invokes memory_search mid-answer ===");
+  const workerLlm = buildWorkerLlmFromConfig({
+    format: "gemini",
+    baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
+    model: "gemini-2.5-flash",
+  });
+  const cfg = {
+    pluginId: "memory-postgres",
+    storage: { schema: "public", chunksTable: "chunks", chunkIndexesTable: "chunk_indexes" },
+    embedding: { model: "qwen3-embedding:0.6b" },
+  };
+  const logger = { info: (m) => console.log("    log:", m), warn: () => {} };
+  const wkDeps = { pool, workerLlm, embedding, cfg, agentId: AGENT, logger };
+
+  // Register a role that has the memory_search tool.
+  const uid = randomUUID().slice(0, 6);
+  const roleKey = `sim_searcher_${uid}`;
+  await upsertWorkerRole(
+    pool,
+    AGENT,
+    roleKey,
+    {
+      systemPrompt:
+        "你是一个助教，要回答用户问题前 **必须先调用 memory_search 工具** 查找历史记忆。" +
+        "如果搜到相关内容，用它回答；如果没搜到，明说你查过没找到。回答简洁，不超过 3 句。",
+      displayName: `Sim Searcher ${uid}`,
+      tools: ["memory_search"],
+    },
+    SCOPE,
+  );
+
+  // A question that obviously benefits from memory_search.
+  const task = {
+    taskId: `t_searcher_${uid}`,
+    roleKey,
+    taskPrompt: "之前有人问过怎么算 1/3 + 1/4 吗？如果有，告诉我答案。",
+    memoryScope: { topic: "math.fractions" },
+    canParallel: true,
+  };
+
+  const result = await dispatchWorker(
+    wkDeps,
+    task,
+    { userId: "u-sim", chatId: "-1003789981008" },
+    task.taskPrompt,
+    SCOPE,
+  );
+
+  console.log(`  ok: ${result.ok}`);
+  console.log(`  tool calls made: ${result.toolCalls?.length ?? 0}${result.toolCalls ? " (" + result.toolCalls.map((c) => c.name).join(",") + ")" : ""}`);
+  if (result.toolCalls?.length) {
+    console.log(`  first call args: ${JSON.stringify(result.toolCalls[0].args)}`);
+  }
+  console.log(`  answer (first 180 chars): ${JSON.stringify(result.answer.slice(0, 180))}`);
+  console.log(`  tokens=${result.llm.inputTokens}→${result.llm.outputTokens} latency=${result.llm.latencyMs}ms`);
+  const usedTool = (result.toolCalls?.length ?? 0) > 0;
+  console.log(`  → tool wiring works: ${usedTool ? "✓" : "✗ (model chose not to call — try a clearer prompt)"}`);
+
+  // Cleanup the role.
+  await pool.query("DELETE FROM moderator.worker_roles WHERE agent_id=$1 AND role_key=$2", [AGENT, roleKey]);
+}
+
 async function main() {
   console.log("Concurrency simulation — Moderator cache + worker pipeline");
   console.log("==========================================================");
@@ -251,6 +315,7 @@ async function main() {
     await scenarioD_mixed();
     await scenarioE_workerRoundtrip();
     await scenarioF_roleAutoRegister();
+    await scenarioG_workerTools();
   } finally {
     await pool.end();
   }

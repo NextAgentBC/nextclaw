@@ -147,6 +147,10 @@ export type AnswerTask = {
     systemPrompt: string;
     displayName?: string;
     memoryScope?: { topic?: string; kind?: string };
+    /** Tool names the specialist is allowed to call. The runtime
+     *  whitelists against the registered tool set, so a typo or
+     *  invented name silently becomes []. */
+    tools?: string[];
   };
 };
 
@@ -265,6 +269,9 @@ export function parseDecision(raw: unknown): { decision: ModeratorDecision; erro
                     topic: typeof ns.memoryScope.topic === "string" ? ns.memoryScope.topic : undefined,
                     kind: typeof ns.memoryScope.kind === "string" ? ns.memoryScope.kind : undefined,
                   }
+                : undefined,
+              tools: Array.isArray(ns.tools)
+                ? ns.tools.filter((t: unknown): t is string => typeof t === "string").slice(0, 8)
                 : undefined,
             };
           }
