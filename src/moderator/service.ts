@@ -232,6 +232,13 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
           `latency=${out.llm.latencyMs ?? "?"}ms`,
       );
 
+      // 3.5. Defensive: if action is clarify/escalate (no worker dispatch
+      //      follows) and the Moderator didn't generate any send_message
+      //      action, synthesize one from rationale. Otherwise the user
+      //      sees silence — which has happened with `clarify` decisions
+      //      where the model returned an empty telegramActions list.
+      ensureUserFacingReply(out.decision);
+
       // 4. Execute side effects.
       const fx = await executeDecision(out.decision, out.state, {
         pool: config.pool,
@@ -460,6 +467,43 @@ function toIntOrUndef(v: string | number | undefined | null): number | undefined
     if (Number.isFinite(n)) {return n;}
   }
   return undefined;
+}
+
+/**
+ * Defensive backstop for `clarify` / `escalate` paths that the model
+ * occasionally emits without an accompanying `send_message` action.
+ *
+ * Without this, those decisions go through executeDecision with an
+ * empty telegramActions list and the user sees no reply at all — which
+ * looks like the bot died (seen live for "你要做一下 research"). We
+ * synthesize a single send_message from the rationale (or escalation
+ * summary) so there's always something on the wire.
+ *
+ * The model's preferred output is still respected: if it DID emit a
+ * send_message, we don't touch anything.
+ */
+function ensureUserFacingReply(decision: import("./types.js").ModeratorDecision): void {
+  if (decision.action !== "clarify" && decision.action !== "escalate") {return;}
+  const acts = decision.telegramActions ?? [];
+  const hasUserFacing = acts.some(
+    (a) => a.kind === "send_message" || (a.kind === "placeholder" && typeof a.text === "string"),
+  );
+  if (hasUserFacing) {return;}
+  let text: string;
+  if (decision.action === "clarify") {
+    // Strip "the bot needs..." / "the user's ..." model-talk; if rationale
+    // is empty or model-meta, fall back to a generic Chinese prompt.
+    const r = decision.rationale?.trim() ?? "";
+    text = r.length > 0 && r.length < 280
+      ? `能不能再说具体一点？${r}`
+      : "能不能再说具体一点？我不太确定你想问什么。";
+  } else {
+    const sum = decision.escalation?.summary?.trim() ?? "";
+    text = sum.length > 0
+      ? `这个问题我先转给人工：${sum}`
+      : "这个问题超出我能处理的范围，已转给人工。";
+  }
+  decision.telegramActions = [...acts, { kind: "send_message", text }];
 }
 
 async function readScopeStatus(pool: Pool, scopeKey: string): Promise<string | null> {

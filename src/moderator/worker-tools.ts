@@ -74,9 +74,34 @@ const MEMORY_SEARCH: ToolDefinition = {
   },
 };
 
+const WEB_SEARCH: ToolDefinition = {
+  name: "web_search",
+  description:
+    "Search the public web via Tavily for current/recent information. " +
+    "Use when the question is about news, recent events, public data, " +
+    "or anything that may have changed after the model's knowledge cutoff. " +
+    "Do NOT use for questions answerable from memory_search or general training knowledge. " +
+    "Each result has {title, url, snippet}; cite the URL if you use the content.",
+  parameters: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "Web search query. Be specific; include dates/years for time-sensitive questions.",
+      },
+      max: {
+        type: "number",
+        description: "Max results. Default 5, hard cap 8.",
+      },
+    },
+    required: ["query"],
+  },
+};
+
 /** Single source of truth — map[toolName] → ToolDefinition. */
 const REGISTRY: Record<string, ToolDefinition> = {
   memory_search: MEMORY_SEARCH,
+  web_search: WEB_SEARCH,
 };
 
 /** Returns tool defs for an allowlist (skips unknown names silently). */
@@ -106,6 +131,9 @@ export async function executeTool(
 ): Promise<ToolResult> {
   if (call.name === "memory_search") {
     return execMemorySearch(deps, call.args);
+  }
+  if (call.name === "web_search") {
+    return execWebSearch(call.args);
   }
   return {
     name: call.name,
@@ -166,5 +194,94 @@ async function execMemorySearch(
       name: "memory_search",
       content: JSON.stringify({ error: `recall_failed: ${(e as Error).message}` }),
     };
+  }
+}
+
+/* -------------------------- web_search (Tavily) --------------------------- */
+
+const WEB_SEARCH_MAX = 8;
+const WEB_SEARCH_DEFAULT = 5;
+const WEB_SEARCH_TIMEOUT_MS = 12_000;
+const WEB_SEARCH_SNIPPET_CHARS = 400;
+
+/**
+ * Resolve the Tavily endpoint:
+ *   1. If `NEXTCLAW_WEB_SEARCH_URL` env is set, use it (full URL).
+ *   2. Else if `TAVILY_API_KEY` env is set, hit api.tavily.com directly.
+ *   3. Else default to the credbroker proxy URL (Tailscale-only, no key needed).
+ *
+ * Order matters: explicit env override > direct API > broker default. The
+ * broker fallback lets the existing Oracle box keep working unchanged.
+ */
+function resolveWebSearchEndpoint(): { url: string; apiKey?: string } {
+  const explicit = process.env.NEXTCLAW_WEB_SEARCH_URL;
+  if (explicit) {
+    return { url: explicit, apiKey: process.env.TAVILY_API_KEY };
+  }
+  const directKey = process.env.TAVILY_API_KEY;
+  if (directKey) {
+    return { url: "https://api.tavily.com/search", apiKey: directKey };
+  }
+  return { url: "http://100.79.97.110:8800/v1/proxy/tavily/search" };
+}
+
+async function execWebSearch(args: Record<string, unknown>): Promise<ToolResult> {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  if (query.length < 2) {
+    return {
+      name: "web_search",
+      content: JSON.stringify({ error: "query required (>=2 chars)" }),
+    };
+  }
+  const maxRaw = typeof args.max === "number" ? args.max : WEB_SEARCH_DEFAULT;
+  const max = Math.min(WEB_SEARCH_MAX, Math.max(1, Math.floor(maxRaw)));
+  const { url, apiKey } = resolveWebSearchEndpoint();
+  const body: Record<string, unknown> = { query, max_results: max };
+  if (apiKey) {body.api_key = apiKey;}
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), WEB_SEARCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      return {
+        name: "web_search",
+        content: JSON.stringify({ error: `HTTP ${resp.status}: ${txt.slice(0, 200)}` }),
+      };
+    }
+    const json = (await resp.json()) as {
+      results?: Array<{ url?: string; title?: string; content?: string; score?: number }>;
+      answer?: string | null;
+    };
+    const results = (json.results ?? []).map((r, i) => ({
+      idx: i + 1,
+      title: r.title ?? "",
+      url: r.url ?? "",
+      snippet: (r.content ?? "").slice(0, WEB_SEARCH_SNIPPET_CHARS),
+      score: typeof r.score === "number" ? Number(r.score.toFixed(3)) : undefined,
+    }));
+    return {
+      name: "web_search",
+      content: JSON.stringify({
+        query,
+        count: results.length,
+        // Tavily sometimes pre-summarizes the answer — pass through if present
+        // so the model can use it as a starting point.
+        synthesized_answer: json.answer ?? null,
+        results,
+      }),
+    };
+  } catch (e) {
+    return {
+      name: "web_search",
+      content: JSON.stringify({ error: `web_search_failed: ${(e as Error).message}` }),
+    };
+  } finally {
+    clearTimeout(timer);
   }
 }

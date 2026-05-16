@@ -305,6 +305,62 @@ async function scenarioG_workerTools() {
   await pool.query("DELETE FROM moderator.worker_roles WHERE agent_id=$1 AND role_key=$2", [AGENT, roleKey]);
 }
 
+async function scenarioH_webSearch() {
+  console.log("\n=== H. web_search tool — worker pulls live web data via Tavily ===");
+  const workerLlm = buildWorkerLlmFromConfig({
+    format: "gemini",
+    baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
+    model: "gemini-2.5-flash",
+  });
+  const cfg = {
+    pluginId: "memory-postgres",
+    storage: { schema: "public", chunksTable: "chunks", chunkIndexesTable: "chunk_indexes" },
+    embedding: { model: "qwen3-embedding:0.6b" },
+  };
+  const logger = { info: (m) => console.log("    log:", m), warn: () => {} };
+  const wkDeps = { pool, workerLlm, embedding, cfg, agentId: AGENT, logger };
+
+  const uid = randomUUID().slice(0, 6);
+  const roleKey = `sim_websearcher_${uid}`;
+  await upsertWorkerRole(
+    pool,
+    AGENT,
+    roleKey,
+    {
+      systemPrompt:
+        "你必须用 web_search 工具查找最新信息再回答。回答 2 段以内，必须包含至少一个具体 URL。",
+      displayName: `Web Searcher ${uid}`,
+      tools: ["web_search"],
+    },
+    SCOPE,
+  );
+  const task = {
+    taskId: `t_web_${uid}`,
+    roleKey,
+    taskPrompt: "OpenClaw 的最新版本号是什么？给我一个来源链接。",
+    canParallel: true,
+  };
+  const result = await dispatchWorker(
+    wkDeps,
+    task,
+    { userId: "u-sim", chatId: "-1003789981008" },
+    task.taskPrompt,
+    SCOPE,
+  );
+
+  console.log(`  ok: ${result.ok}`);
+  console.log(`  tool calls: ${result.toolCalls?.length ?? 0}${result.toolCalls ? " (" + result.toolCalls.map((c) => c.name).join(",") + ")" : ""}`);
+  if (result.toolCalls?.length) {
+    console.log(`  first call args: ${JSON.stringify(result.toolCalls[0].args)}`);
+  }
+  console.log(`  answer (first 220 chars): ${JSON.stringify(result.answer.slice(0, 220))}`);
+  console.log(`  tokens=${result.llm.inputTokens}→${result.llm.outputTokens} latency=${result.llm.latencyMs}ms`);
+  const usedWeb = (result.toolCalls ?? []).some((c) => c.name === "web_search");
+  console.log(`  → web_search invoked: ${usedWeb ? "✓" : "✗"}`);
+
+  await pool.query("DELETE FROM moderator.worker_roles WHERE agent_id=$1 AND role_key=$2", [AGENT, roleKey]);
+}
+
 async function main() {
   console.log("Concurrency simulation — Moderator cache + worker pipeline");
   console.log("==========================================================");
@@ -316,6 +372,7 @@ async function main() {
     await scenarioE_workerRoundtrip();
     await scenarioF_roleAutoRegister();
     await scenarioG_workerTools();
+    await scenarioH_webSearch();
   } finally {
     await pool.end();
   }
