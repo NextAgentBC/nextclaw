@@ -114,30 +114,69 @@ export default definePluginEntry({
       { names: ["memory_forget"] },
     );
 
-    // Moderator event hook: must be registered at the SYNCHRONOUS top
-    // of register() so openclaw wires it before any messages route.
-    // The actual moderatorHandle is created inside registerService below
-    // (it needs pg pool + llm client + telegram token which only become
-    // available after start(ctx) fires). The hook captures the handle
-    // by closure and no-ops until start() completes.
-    api.on("message_received", async (event, hookCtx) => {
+    // Moderator event hook — registered as `inbound_claim` (not the older
+    // `message_received` observer) so we can CLAIM the message and prevent
+    // codex's parallel reply on Telegram group @-mentions.
+    //
+    // Why this is necessary: before this change, the Moderator handled the
+    // group @-mention and replied via direct Telegram API calls, but the
+    // codex per-channel agent ALSO replied because `message_received` is a
+    // fire-and-forget observer and openclaw's dispatcher kept running. The
+    // user saw two answers per group question — one from the Moderator
+    // worker (gemini-flash, no web tools) and one from codex (gpt-5.5 with
+    // tavily). With inbound_claim we return `{handled:true}` to stop
+    // codex's downstream path; DMs are unaffected because we only claim
+    // group/supergroup channels.
+    api.on("inbound_claim", async (event, hookCtx) => {
       const ctxObj = hookCtx as { channelId?: string; conversationId?: string; senderId?: string };
-      // TEMP debug — verify the hook is firing at all (next commit will
-      // demote this to debug level after we've confirmed the wiring).
-      api.logger.info(
-        `[moderator/hook] message_received fired: channel=${ctxObj?.channelId} ` +
-          `conv=${ctxObj?.conversationId} sender=${ctxObj?.senderId} ` +
-          `handle=${MODULE_MODERATOR_HANDLE ? "bound" : "unbound"}`,
-      );
+      const channelId = ctxObj?.channelId;
+      if (channelId !== "telegram") {return;}
       if (!MODULE_MODERATOR_HANDLE) {return;}
+
+      // Always forward to the Moderator so its state machine tracks every
+      // message (it filters DM internally). Construct the
+      // PluginMessageEvent shape the service expects.
+      const mEv = {
+        from: event.senderId,
+        senderId: event.senderId,
+        content: event.content,
+        timestamp: event.timestamp ? new Date(event.timestamp).toISOString() : undefined,
+        threadId: event.threadId,
+        messageId: event.messageId,
+        metadata: {
+          senderName: event.senderName,
+          senderUsername: event.senderUsername,
+          threadId: event.threadId,
+        },
+      };
       try {
         MODULE_MODERATOR_HANDLE.onMessageReceived(
-          event as Parameters<ModeratorServiceHandle["onMessageReceived"]>[0],
+          mEv as Parameters<ModeratorServiceHandle["onMessageReceived"]>[0],
           hookCtx as Parameters<ModeratorServiceHandle["onMessageReceived"]>[1],
         );
       } catch (err) {
-        api.logger.warn(`memory-postgres: moderator hook threw: ${(err as Error).message}`);
+        api.logger.warn(`memory-postgres: moderator inbound_claim hook threw: ${(err as Error).message}`);
       }
+
+      // Decide whether to CLAIM. The rule MUST match the Moderator's own
+      // group-and-addressed filter in service.ts (looksAddressed +
+      // inferChatTypeFromId), otherwise we'd either:
+      //   - claim a DM the Moderator won't actually answer → user silence
+      //   - leave a group mention un-claimed → double reply (the original bug)
+      const conv = (ctxObj.conversationId ?? "").replace(
+        /^(?:channel:|chat:|user:|tg-?|telegram:|slack:|discord:|whatsapp:)/,
+        "",
+      );
+      const isGroup = conv.startsWith("-");
+      if (!isGroup) {return;}
+      const addressed = /@\w+_bot|@bot\b|^\/(start|ask|help)/i.test(event.content ?? "");
+      if (!addressed) {return;}
+
+      api.logger.info(
+        `[moderator/hook] inbound_claim CLAIMED: conv=${ctxObj.conversationId} sender=${ctxObj.senderId} ` +
+          `(group mention — codex skipped)`,
+      );
+      return { handled: true };
     });
 
     /**
