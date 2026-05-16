@@ -28,6 +28,7 @@ import {
   routeConceptTag,
   routeEntityRef,
   routeFullText,
+  routeGraphWalk,
   routeSemantic,
   routeTimeBucket,
   routeTrgm,
@@ -35,8 +36,9 @@ import {
   type MergeWeights,
 } from "./routes.js";
 import { categorize } from "../structured/categorizer.js";
+import { inferTimeBucketsFromQuery } from "./temporal.js";
 import type { RecallContext, RouteName } from "./types.js";
-import { workingSetFor } from "./working-set.js";
+import { primeWorkingSetWithProfiles, workingSetFor } from "./working-set.js";
 
 /* ----------------------- query-side anchor inference ---------------------- */
 /**
@@ -156,6 +158,7 @@ const STRUCTURED_ROUTES: RouteName[] = [
   "concept_tag",
   "time_bucket",
   "category",
+  "graph_walk",
 ];
 
 /* --------------------------------- helpers --------------------------------- */
@@ -262,6 +265,18 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
   const { qHash } = hashQuery(input.query, scope);
   const ws = workingSetFor(input.agentSessionId, deps.cfg.tiers.t0SizeLimit, input.agentId);
 
+  // First recall of a session: prime T0 with this agent's profile chunks
+  // (MemGPT-style "core memory" — per-agent + per-entity summaries that
+  // always live in context). Idempotent; <50µs after the first call.
+  if (!ws.hasProfilesPrimed()) {
+    await primeWorkingSetWithProfiles(
+      deps.pool,
+      input.agentId ?? "main",
+      ws,
+      deps.cfg.tiers.t0SizeLimit,
+    ).catch(() => 0);
+  }
+
   // ---------- T0 working set (in-process; sub-ms) ----------
   const t0Hits = ws.search(input.query, k);
   if (t0Hits.length >= Math.max(1, Math.ceil(k / 2))) {
@@ -346,9 +361,15 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
   const inferredCategories = categorize(input.query)
     .filter((h) => h.category !== "other")
     .map((h) => h.category);
+  // Temporal inference: "昨天" / "上周" / "yesterday" / "last week" etc.
+  // get translated into a list of YYYY-MM-DD bucket strings. routeTimeBucket
+  // unions these with any explicit ctx.timeBucket. Cheap regex, no DB hit.
+  const inferredTemporal = inferTimeBucketsFromQuery(input.query);
+
   const ctxBase: RecallContext = {
     query: input.query,
     timeBucket: input.timeBucket,
+    timeBuckets: inferredTemporal?.buckets,
     anchors: inferredAnchors,
     entityIds: input.entityIds,
     conceptTags: inferredTags,
@@ -357,12 +378,23 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
     agentId: input.agentId ?? "main",
   };
 
-  const [anchorRows, entityRefRows, timeBucketRows, conceptTagRows, categoryRows] = await Promise.all([
+  const [
+    anchorRows,
+    entityRefRows,
+    timeBucketRows,
+    conceptTagRows,
+    categoryRows,
+    graphWalkRows,
+  ] = await Promise.all([
     routeAnchor(deps.pool, ctxBase),
     routeEntityRef(deps.pool, ctxBase),
     routeTimeBucket(deps.pool, ctxBase),
     routeConceptTag(deps.pool, ctxBase),
     routeCategory(deps.pool, ctxBase),
+    // 1-hop graph walk over structured.relations (auto-resolves seed
+    // entities from concept tags / explicit entityIds). Returns [] cheaply
+    // when neither source yields anything, so safe to fan out always.
+    routeGraphWalk(deps.pool, ctxBase),
   ]);
   const structuredFlat = [
     ...anchorRows,
@@ -370,6 +402,7 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
     ...timeBucketRows,
     ...conceptTagRows,
     ...categoryRows,
+    ...graphWalkRows,
   ];
   if (structuredFlat.length > 0) {
     routesRun.push(...STRUCTURED_ROUTES);
@@ -424,6 +457,7 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
       { route: "time_bucket", candidates: timeBucketRows },
       { route: "concept_tag", candidates: conceptTagRows },
       { route: "category",    candidates: categoryRows },
+      { route: "graph_walk",  candidates: graphWalkRows },
     ],
     input.weights,
   );

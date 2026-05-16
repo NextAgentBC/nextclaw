@@ -8,6 +8,7 @@
  * Eviction: capped at cfg.tiers.t0SizeLimit; LRU on access.
  */
 
+import type { Pool } from "pg";
 import type { MergedCandidate } from "./routes.js";
 
 export type WorkingSetEntry = {
@@ -18,11 +19,20 @@ export type WorkingSetEntry = {
 
 export class WorkingSet {
   private readonly entries = new Map<string, WorkingSetEntry>();
+  /**
+   * One-shot guard: profile primer only runs once per WorkingSet instance.
+   * Profile chunks land in T0 the first time the session asks for anything;
+   * subsequent recalls just see them as already-resident high-warmth entries.
+   */
+  private profilesPrimed = false;
   constructor(private readonly maxSize: number) {}
 
   size(): number {
     return this.entries.size;
   }
+
+  hasProfilesPrimed(): boolean { return this.profilesPrimed; }
+  markProfilesPrimed(): void { this.profilesPrimed = true; }
 
   /** Insert / refresh an entry. */
   add(c: MergedCandidate): void {
@@ -135,4 +145,52 @@ export function workingSetFor(
 
 export function clearAllWorkingSets(): void {
   REGISTRY.clear();
+}
+
+/**
+ * Profile chunks (`kind='profile'`) are the "core memory" pattern borrowed
+ * from MemGPT/Letta: per-agent (and optionally per-entity) summaries that
+ * stay resident in T0 across every recall, instead of being one of many
+ * chunks competing for top-k slots.
+ *
+ * Called lazily on the first recall in a session. Cheap: O(<profile count>)
+ * which for a well-curated agent is typically <20 chunks. Idempotent via
+ * the `profilesPrimed` flag on the WorkingSet.
+ */
+export async function primeWorkingSetWithProfiles(
+  pool: Pool,
+  agentId: string,
+  ws: WorkingSet,
+  cap: number,
+): Promise<number> {
+  if (ws.hasProfilesPrimed()) {return 0;}
+  ws.markProfilesPrimed();
+  const rows = await pool
+    .query<{ id: string; source: string; source_ref: string | null; text: string; importance: number }>(
+      `SELECT id, source, source_ref, text, importance
+         FROM semantic.chunks
+        WHERE agent_id = $1
+          AND kind = 'profile'
+          AND retention_class != 'trash'
+          AND retention_class != 'tombstone'
+        ORDER BY importance DESC, last_recalled_at DESC NULLS LAST, created_at DESC
+        LIMIT $2`,
+      [agentId, Math.max(1, Math.floor(cap / 2))], // leave room for fresh recall hits
+    )
+    .catch(() => ({ rows: [] as Array<{ id: string; source: string; source_ref: string | null; text: string; importance: number }> }));
+  let added = 0;
+  for (const r of rows.rows) {
+    ws.add({
+      chunkId: r.id,
+      source: r.source,
+      sourceRef: r.source_ref,
+      text: r.text,
+      rawScore: r.importance,
+      normScore: 1.0,
+      hits: ["entity_ref"], // tag as a "profile" hit via the closest semantic
+      combinedScore: 1.0 + r.importance,
+    });
+    added += 1;
+  }
+  return added;
 }

@@ -24,9 +24,19 @@ import { startDashboardServer, type DashboardServer } from "./src/dashboard/serv
 import { buildPromptSection } from "./src/prompt-section.js";
 import { migrate, ensureHnswIndex } from "./src/storage/migrate.js";
 import { closePool, getPool, type ResolvedPoolConfig } from "./src/storage/pool.js";
-import { buildSearchTool, buildStoreTool } from "./src/tools.js";
+import {
+  buildForgetTool,
+  buildSearchTool,
+  buildStoreTool,
+  buildUpdateTool,
+} from "./src/tools.js";
 import { compactCold } from "./src/workers/compactor.js";
 import { startGitWatcherDaemon, type GitWatcherHandle } from "./src/workers/git-watcher.js";
+import {
+  buildReflectionClient,
+  startReflectionDaemon,
+  type ReflectionDaemonHandle,
+} from "./src/workers/reflection.js";
 import { startTranscriptWatcherDaemon, type TranscriptWatcherHandle } from "./src/workers/transcript-watcher.js";
 import { startShadowComparator } from "./src/workers/shadow-comparator.js";
 import { evaluateGuards, runDailyAnalyzer } from "./src/workers/tuning.js";
@@ -70,6 +80,28 @@ export default definePluginEntry({
       { names: ["memory_store"] },
     );
 
+    api.registerTool(
+      (ctx) => {
+        const config = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
+        if (!config) {
+          throw new Error("memory-postgres: no runtime config available in tool context");
+        }
+        return buildUpdateTool({ config, sessionKey: ctx.sessionKey });
+      },
+      { names: ["memory_update"] },
+    );
+
+    api.registerTool(
+      (ctx) => {
+        const config = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
+        if (!config) {
+          throw new Error("memory-postgres: no runtime config available in tool context");
+        }
+        return buildForgetTool({ config, sessionKey: ctx.sessionKey });
+      },
+      { names: ["memory_forget"] },
+    );
+
     /**
      * Background service: dashboard + scheduled workers.
      *
@@ -83,6 +115,7 @@ export default definePluginEntry({
     let gitWatcherHandles: GitWatcherHandle[] = [];
     let transcriptWatcherHandles: TranscriptWatcherHandle[] = [];
     let shadowHandles: Array<{ stop: () => void }> = [];
+    let reflectionHandle: ReflectionDaemonHandle | null = null;
     let activePoolCfg: ResolvedPoolConfig | null = null;
 
     api.registerService({
@@ -118,7 +151,18 @@ export default definePluginEntry({
         try {
           const pool = await getPool(activePoolCfg);
           await migrate(pool);
-          await ensureHnswIndex(pool).catch(() => undefined);
+          // HNSW build can legitimately fail on a fresh install (no embeddings
+          // yet → no known dim → no index). It can also fail in ways that
+          // silently degrade T2 hybrid recall to seq scan (pgvector version
+          // mismatch, OOM during build, etc). Surface either reason — the
+          // first case is informational, the second is the user's only signal.
+          await ensureHnswIndex(pool).catch((err) =>
+            api.logger.warn(
+              `memory-postgres: HNSW index not built (T2 hybrid will fall back to seq scan): ${
+                (err as Error).message
+              }`,
+            ),
+          );
         } catch (err) {
           api.logger.warn(
             `memory-postgres: schema migrate failed (will retry on first op): ${(err as Error).message}`,
@@ -252,6 +296,42 @@ export default definePluginEntry({
           }
         }
 
+        // Reflection worker — daily LLM pass that produces a `kind='reflection'`
+        // summary chunk per agent plus optional `kind='profile'` bullets that
+        // get primed into T0 on every subsequent recall. Opt-in: stays off
+        // unless `reflection.enabled` AND a model endpoint is configured.
+        if (cfg.reflection.enabled && cfg.reflection.model.baseUrl) {
+          try {
+            const pool = await getPool(activePoolCfg);
+            const embedding = buildEmbeddingClientFromConfig({
+              baseUrl: cfg.embedding.baseUrl,
+              model: cfg.embedding.model,
+              apiKeyEnv: cfg.embedding.apiKeyEnv,
+              format: cfg.embedding.format,
+              path: cfg.embedding.path,
+            });
+            const llm = buildReflectionClient(cfg.reflection);
+            reflectionHandle = startReflectionDaemon({
+              deps: { pool, embedding, llm, cfg: cfg.reflection },
+              intervalMs: cfg.reflection.intervalMs,
+              logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
+            });
+            api.logger.info(
+              `memory-postgres: reflection daemon started — ` +
+                `format=${cfg.reflection.model.format} model=${cfg.reflection.model.model} ` +
+                `intervalMs=${cfg.reflection.intervalMs}`,
+            );
+          } catch (err) {
+            api.logger.warn(
+              `memory-postgres: reflection daemon failed to start: ${(err as Error).message}`,
+            );
+          }
+        } else if (cfg.reflection.enabled) {
+          api.logger.warn(
+            "memory-postgres: reflection.enabled=true but model.baseUrl is empty — daemon NOT started.",
+          );
+        }
+
         // Shadow comparators — for every gpt-5.5 turn we observe in the
         // trajectory, replay the same prompt against a challenger model
         // (qwen3.6-35B by default) and store both sides side-by-side. Lets
@@ -277,6 +357,10 @@ export default definePluginEntry({
       async stop() {
         if (tuningTimer) {clearInterval(tuningTimer);}
         if (compactorTimer) {clearInterval(compactorTimer);}
+        if (reflectionHandle) {
+          try { reflectionHandle.stop(); } catch { /* ignore */ }
+          reflectionHandle = null;
+        }
         tuningTimer = null;
         compactorTimer = null;
         for (const h of gitWatcherHandles) {
@@ -312,7 +396,8 @@ export default definePluginEntry({
 
     api.logger.info(
       "memory-postgres: capability + tools registered "
-        + "(memory_search, memory_store, dashboard, tuning, compactor)",
+        + "(memory_search, memory_store, memory_update, memory_forget; "
+        + "services: dashboard, tuning, compactor, reflection)",
     );
   },
 });

@@ -16,7 +16,9 @@ export const buildPromptSection: MemoryPromptSectionBuilder = ({
 }) => {
   const hasSearch = availableTools.has("memory_search");
   const hasStore = availableTools.has("memory_store");
-  if (!hasSearch && !hasStore) {return [];}
+  const hasUpdate = availableTools.has("memory_update");
+  const hasForget = availableTools.has("memory_forget");
+  if (!hasSearch && !hasStore && !hasUpdate && !hasForget) {return [];}
 
   const lines: string[] = ["## Memory Recall (memory-postgres)"];
 
@@ -35,6 +37,33 @@ export const buildPromptSection: MemoryPromptSectionBuilder = ({
         + "metric (calories, time spent, count, etc.), use `memory_store` to persist it. "
         + "Pin (`pinned: true`) only for truly long-term preferences. "
         + "Pass anchors so future recall finds it without semantic search.",
+    );
+  }
+
+  if (hasUpdate || hasForget) {
+    lines.push("## Memory Curation (agent-active editing)");
+    lines.push(
+      "Memory is not append-only. You are expected to **curate** it as facts change:",
+    );
+    if (hasUpdate) {
+      lines.push(
+        "- `memory_update(chunkId, ...)` — rewrite a chunk's text, change its importance, or "
+          + "pin/unpin it. Use when a fact has evolved (the user's preference changed; the project "
+          + "scope shifted) or you realise an earlier write was inaccurate. The chunk re-embeds "
+          + "automatically when you pass `text`.",
+      );
+    }
+    if (hasForget) {
+      lines.push(
+        "- `memory_forget(chunkId, ...)` — soft-trash a chunk so it stops appearing in recall. "
+          + "Use when the user asks you to forget something, when you stored something wrong, "
+          + "or when a fact is now stale. Default is soft (auditable); only pass `hardDelete: true` "
+          + "if the user explicitly asks for true deletion.",
+      );
+    }
+    lines.push(
+      "Both operations take a `chunkId` from a recent `memory_search` result. Cross-agent edits "
+        + "are blocked at the SQL layer — you can only edit chunks you own.",
     );
   }
 

@@ -1,17 +1,29 @@
 /**
- * qwen3 embedding client via the Ollama-compatible /api/embed endpoint.
+ * Embedding client with three wire formats:
  *
- * Single round-trip; supports batching (embeddings: [...]).
- * Auth: Bearer ${env[apiKeyEnv]} when apiKeyEnv is set; otherwise unauth (LAN).
+ *   - `jina`   — `https://api.jina.ai/v1/embeddings` (DEFAULT).
+ *                Adds an asymmetric `task` body parameter
+ *                (`retrieval.passage` for ingest, `retrieval.query` for recall).
+ *                Free tier on jina.ai/embeddings gives 1M tokens with no card
+ *                required, which keeps the 0→1 install path frictionless.
+ *   - `openai` — standard `/v1/embeddings` shape; works with OpenAI itself
+ *                and most compat endpoints (Together, vLLM, TEI, ...).
+ *                No asymmetric retrieval hint — both sides embed the same way.
+ *   - `ollama` — local Ollama `/api/embed`; for qwen3-embedding the query
+ *                side gets a prefix prepended to the input text rather than
+ *                a separate body parameter.
+ *
+ * Auth: `Authorization: Bearer ${env[apiKeyEnv]}` when apiKeyEnv is set;
+ * otherwise no auth header (works for LAN ollama).
  *
  * Why a thin standalone client and not the bundled ollama provider adapter:
  * the ollama plugin lives behind plugins.entries.ollama and pulls in heavier
- * provider plumbing. Here we want a tight, focused embed call we can use from
- * Phase 1 ingest/recall paths and from the doctor reachability probe — without
+ * provider plumbing. Here we want a tight, focused embed call usable from
+ * ingest/recall paths and from the doctor reachability probe without
  * cross-extension prod imports.
  */
 
-export type EmbeddingApiFormat = "ollama" | "openai";
+export type EmbeddingApiFormat = "ollama" | "openai" | "jina";
 
 export type EmbeddingClientConfig = {
   baseUrl: string;
@@ -20,10 +32,8 @@ export type EmbeddingClientConfig = {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   /**
-   * Wire format. `ollama` posts `/api/embed` with `{model, input}` and reads
-   * `{embeddings: number[][]}`. `openai` posts `/v1/embeddings` with the
-   * `{model, input}` shape and reads `{data: [{embedding: number[]}]}`.
-   * Default: `ollama` (backward-compat with the original config).
+   * Wire format. See top-of-file docblock for per-format behavior.
+   * Default `jina` — frictionless free-tier first-run experience.
    */
   format?: EmbeddingApiFormat;
   /**
@@ -35,7 +45,15 @@ export type EmbeddingClientConfig = {
 
 export type EmbedRequest = {
   inputs: string[];
-  /** qwen3 supports an optional task prefix; recall uses it, ingest does not. */
+  /**
+   * Asymmetric retrieval hint. `query` is sent on recall paths; ingest paths
+   * pass `null` (or omit) for the symmetric/passage case.
+   *
+   * Per-format behavior:
+   *   - `jina`   → `task: "retrieval.query"` vs `"retrieval.passage"` default
+   *   - `ollama` → prepends qwen3 instruct prefix to the input text
+   *   - `openai` → ignored (no widely-supported asymmetric flag)
+   */
   taskPrefix?: "query" | null;
 };
 
@@ -46,11 +64,43 @@ export type EmbedResult = {
   latencyMs: number;
 };
 
-const QUERY_PREFIX = "Instruct: Given a user query, retrieve relevant memory notes and documents\nQuery:";
+const OLLAMA_QUERY_PREFIX =
+  "Instruct: Given a user query, retrieve relevant memory notes and documents\nQuery:";
 
-function decoratedInputs(inputs: string[], taskPrefix: EmbedRequest["taskPrefix"]): string[] {
+function decoratedInputs(
+  inputs: string[],
+  taskPrefix: EmbedRequest["taskPrefix"],
+  format: EmbeddingApiFormat,
+): string[] {
   if (taskPrefix !== "query") {return inputs;}
-  return inputs.map((s) => `${QUERY_PREFIX}${s}`);
+  // Only ollama/qwen3 uses prefix-decoration. Jina has a separate `task`
+  // body parameter; plain OpenAI compat has nothing.
+  if (format !== "ollama") {return inputs;}
+  return inputs.map((s) => `${OLLAMA_QUERY_PREFIX}${s}`);
+}
+
+function defaultPathFor(format: EmbeddingApiFormat): string {
+  if (format === "ollama") {return "/api/embed";}
+  return "/v1/embeddings";
+}
+
+function buildBody(
+  cfg: EmbeddingClientConfig,
+  format: EmbeddingApiFormat,
+  inputs: string[],
+  taskPrefix: EmbedRequest["taskPrefix"],
+): string {
+  if (format === "jina") {
+    return JSON.stringify({
+      model: cfg.model,
+      input: inputs,
+      task: taskPrefix === "query" ? "retrieval.query" : "retrieval.passage",
+    });
+  }
+  return JSON.stringify({
+    model: cfg.model,
+    input: decoratedInputs(inputs, taskPrefix, format),
+  });
 }
 
 export class EmbeddingClient {
@@ -63,18 +113,15 @@ export class EmbeddingClient {
     if (req.inputs.length === 0) {
       return { embeddings: [], model: this.cfg.model, dims: 0, latencyMs: 0 };
     }
-    const format: EmbeddingApiFormat = this.cfg.format ?? "ollama";
-    const path = this.cfg.path ?? (format === "openai" ? "/v1/embeddings" : "/api/embed");
+    const format: EmbeddingApiFormat = this.cfg.format ?? "jina";
+    const path = this.cfg.path ?? defaultPathFor(format);
     // Concat directly — `new URL(path, base)` would replace the base's pathname
     // when `path` starts with `/`, which breaks proxy-prefixed endpoints like
     // `http://broker/v1/proxy/local-embed`.
     const baseTrimmed = this.cfg.baseUrl.replace(/\/+$/, "");
     const pathPrefixed = path.startsWith("/") ? path : `/${path}`;
     const url = `${baseTrimmed}${pathPrefixed}`;
-    const body = JSON.stringify({
-      model: this.cfg.model,
-      input: decoratedInputs(req.inputs, req.taskPrefix ?? null),
-    });
+    const body = buildBody(this.cfg, format, req.inputs, req.taskPrefix ?? null);
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.cfg.apiKey) {headers["authorization"] = `Bearer ${this.cfg.apiKey}`;}
 
@@ -93,10 +140,10 @@ export class EmbeddingClient {
     }
     const json = (await resp.json()) as
       | { embeddings?: number[][] }                                     // ollama
-      | { data?: Array<{ embedding?: number[]; index?: number }> };    // openai
-    const embeddings = format === "openai"
-      ? extractOpenAiEmbeddings(json as { data?: Array<{ embedding?: number[]; index?: number }> })
-      : ((json as { embeddings?: number[][] }).embeddings ?? []);
+      | { data?: Array<{ embedding?: number[]; index?: number }> };    // openai / jina
+    const embeddings = format === "ollama"
+      ? ((json as { embeddings?: number[][] }).embeddings ?? [])
+      : extractOpenAiEmbeddings(json as { data?: Array<{ embedding?: number[]; index?: number }> });
     if (embeddings.length !== req.inputs.length) {
       throw new Error(
         `[memory-postgres] embed response missing embeddings (got ${embeddings.length}, expected ${req.inputs.length})`,
@@ -122,22 +169,51 @@ export class EmbeddingClient {
   }
 }
 
+/**
+ * Defaults baked in when the corresponding config field is missing:
+ *   format=jina, baseUrl=https://api.jina.ai/v1, model=jina-embeddings-v3,
+ *   apiKeyEnv=JINA_API_KEY.
+ *
+ * Each default is applied independently, so a caller can mix-and-match
+ * (e.g. set `format: "ollama"` without re-specifying baseUrl).
+ */
 export function buildEmbeddingClientFromConfig(cfg: {
   baseUrl?: string;
-  model: string;
+  model?: string;
   apiKeyEnv?: string;
   format?: EmbeddingApiFormat;
   path?: string;
 }): EmbeddingClient {
-  const baseUrl = cfg.baseUrl ?? "http://127.0.0.1:11434";
-  const apiKey = cfg.apiKeyEnv ? process.env[cfg.apiKeyEnv] : undefined;
+  const format: EmbeddingApiFormat = cfg.format ?? "jina";
+  const baseUrl = cfg.baseUrl ?? defaultBaseUrlFor(format);
+  const model = cfg.model ?? defaultModelFor(format);
+  const apiKeyEnv = cfg.apiKeyEnv ?? defaultApiKeyEnvFor(format);
+  const apiKey = apiKeyEnv ? process.env[apiKeyEnv] : undefined;
   return new EmbeddingClient({
     baseUrl,
-    model: cfg.model,
+    model,
     apiKey,
-    format: cfg.format,
+    format,
     path: cfg.path,
   });
+}
+
+function defaultBaseUrlFor(format: EmbeddingApiFormat): string {
+  if (format === "ollama") {return "http://127.0.0.1:11434";}
+  if (format === "openai") {return "https://api.openai.com";}
+  return "https://api.jina.ai";
+}
+
+function defaultModelFor(format: EmbeddingApiFormat): string {
+  if (format === "ollama") {return "qwen3-embedding:4b";}
+  if (format === "openai") {return "text-embedding-3-small";}
+  return "jina-embeddings-v3";
+}
+
+function defaultApiKeyEnvFor(format: EmbeddingApiFormat): string | undefined {
+  if (format === "ollama") {return undefined;}
+  if (format === "openai") {return "OPENAI_API_KEY";}
+  return "JINA_API_KEY";
 }
 
 function extractOpenAiEmbeddings(

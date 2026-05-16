@@ -1,5 +1,118 @@
 # Changelog
 
+## 0.2.0 — Jina-default + active memory
+
+The 0.1.0 release was passive: chunks went in, chunks came out via 8
+deterministic routes. 0.2.0 adds three shifts borrowed from post-RAG
+agent-memory work (MemGPT/Letta core memory, Karpathy "agent's wiki",
+GraphRAG) plus a frictionless first-run path:
+
+### Embedding default → Jina free tier
+
+- `format=jina` is now the default. `jina-embeddings-v3` over
+  `https://api.jina.ai` with `JINA_API_KEY` env. 1M tokens / no card.
+  Asymmetric retrieval: ingest sends `task=retrieval.passage`, recall
+  sends `task=retrieval.query`.
+- Per-format defaults: `format=ollama` fills in `127.0.0.1:11434` +
+  `qwen3-embedding:4b`; `format=openai` fills in `api.openai.com` +
+  `text-embedding-3-small` + `OPENAI_API_KEY`. Pick a format, get a
+  working setup.
+- `embedding` block is now optional at the manifest level. Minimal
+  config is just `postgres.url`.
+
+### New recall route — `graph_walk` (GraphRAG-style 1-hop)
+
+- 9th parallel route. Seeds from `ctx.entityIds` (explicit) and
+  auto-resolves seeds from concept-tag matches against
+  `structured.entities` (canonical name + aliases + pg_trgm fuzzy).
+- Walks one hop over `structured.relations`, then joins back to chunks
+  via `chunk_indexes(kind='entity_ref')`. Score combines distinct
+  neighbor count × average relation confidence.
+- Weight: 0.9 (below `entity_ref` direct mention at 1.0, above
+  `concept_tag` substring at 0.8).
+
+### Agent-active memory editing — `memory_update` / `memory_forget`
+
+- Two new tools the agent can call to **curate** its own memory.
+  `memory_update(chunkId, ...)` rewrites text (re-embeds), shifts
+  importance, or flips retention class. `memory_forget(chunkId, ...)`
+  soft-trashes (default) or hard-tombstones.
+- Both enforce per-agent isolation at the SQL layer: an `agent:club`
+  call hitting `agent:main`'s chunkId fails with `wrong-agent`.
+- Edits invalidate `cache.recall` and clear `cache.hot_chunks` so the
+  agent's own changes are reflected in the next recall.
+- `audit.ingest_decisions` gains `chunk_id`, `reason`, `agent_session_id`
+  columns (migration `27-edit-audit.sql`) so the dashboard can show edit
+  lineage alongside ingest.
+
+### Profile chunks (MemGPT core memory) — primed into T0 on first recall
+
+- New chunk convention: `kind='profile'`, `retention_class='pinned'`.
+  Per-agent (and per-entity if you want) curated facts that always
+  live in the T0 working set instead of competing for top-k slots.
+- First recall in a session calls `primeWorkingSetWithProfiles` which
+  loads all `kind='profile'` chunks for `agent_id` into the working
+  set. Idempotent via a `profilesPrimed` flag on `WorkingSet`.
+- Profile chunks are normally written by the reflection worker; the
+  agent can also pin manually via `memory_update`.
+
+### Reflection worker — daily LLM consolidation
+
+- New optional worker. Runs on `cfg.reflection.intervalMs` (default 24h,
+  min 1h). Per agent, pulls last `lookbackHours` of conversation chunks
+  (cap `maxInputChars`), asks an LLM to emit a 2–4 sentence
+  REFLECTION + a list of PROFILE_DELTA bullets.
+- Writes the reflection as `kind='reflection'` (standard retention),
+  bullets as `kind='profile'` (pinned). Both available on next recall.
+- **Two LLM transports**: `model.format=openai` for any
+  `/v1/chat/completions` endpoint, or `model.format=gemini` for
+  Google's native `/v1beta/models/<m>:generateContent`. The Gemini path
+  works directly against `generativelanguage.googleapis.com` (with
+  `apiKeyEnv` → `?key=`), and also against a Tailscale credential
+  broker proxy that injects the key server-side (no caller key).
+- Off by default. Opt in with `reflection.enabled: true` + a `model`
+  block.
+
+### Temporal query routing — bilingual
+
+- New `src/recall/temporal.ts` parses `今天 / 昨天 / 前天 / N 天前 /
+  this week / last week / this month / last month / yesterday / today /
+  YYYY-MM-DD / 2026年5月10日` from query text and emits a list of
+  `YYYY-MM-DD` bucket strings.
+- `routeTimeBucket` now takes both `ctx.timeBucket` (single, explicit)
+  and `ctx.timeBuckets` (range, inferred); unions and scores by
+  distinct-bucket hit count.
+
+### Low-risk hardening from 0.1.x review
+
+- `ensureHnswIndex` failures no longer get swallowed in `index.ts`,
+  `manager-runtime.ts`, or `src/tools.ts`. Logs a `warn` with the
+  underlying error so a silently-degraded T2 (HNSW failed →
+  seq scan) is visible.
+- `agentIdFromSessionKey` is now fail-closed: unknown sessionKey
+  shapes throw instead of silently bucketing into `main`. Empty /
+  undefined still resolves to `main` (manual scripts, doctor probes).
+- New tests cover Jina format passage/query body parameter, embedded
+  defaults fall-through, agentId fail-closed parser, and the temporal
+  inferrer's 12 cases.
+
+### Migrations
+
+- `src/storage/schema/27-edit-audit.sql` — adds `chunk_id`, `reason`,
+  `agent_session_id`, `scored_at` columns to `audit.ingest_decisions`;
+  loosens `text_hash` / `text_excerpt` to nullable so edit-lineage
+  rows don't need to repeat the chunk text.
+
+### Breaking-ish
+
+- If you were relying on `embedding.provider` + `embedding.model`
+  being required at the manifest level, those constraints are gone.
+  Existing configs that include them keep working unchanged.
+- `agentIdFromSessionKey` (used by `memory_search` / `memory_store`)
+  no longer falls back to `main` for unrecognised session-key shapes.
+  If you're injecting custom session keys, ensure they start with
+  `agent:<agentId>:`.
+
 ## 0.1.0 — initial public release
 
 First open release. Built and validated against OpenClaw `>=2026.4.25`.

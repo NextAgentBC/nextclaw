@@ -220,23 +220,33 @@ export async function routeTimeBucket(
   pool: Pool,
   ctx: RecallContext,
 ): Promise<RouteCandidate[]> {
-  if (!ctx.timeBucket) {return [];}
+  // Union explicit single bucket + inferred range buckets.
+  const bucketSet = new Set<string>();
+  if (ctx.timeBucket) {bucketSet.add(ctx.timeBucket);}
+  for (const b of ctx.timeBuckets ?? []) {bucketSet.add(b);}
+  if (bucketSet.size === 0) {return [];}
+  const buckets = [...bucketSet];
   const k = ctx.perRouteK ?? DEFAULT_K;
   const aid = ctx.agentId ?? "main";
-  const rows = await pool.query<RouteRow>(
-    `SELECT c.id AS chunk_id, c.source, c.source_ref, c.text
+  const rows = await pool.query<RouteRow & { hits: number }>(
+    `SELECT c.id AS chunk_id, c.source, c.source_ref, c.text,
+            count(*)::int AS hits
        FROM semantic.chunk_indexes ci
        JOIN semantic.chunks c ON c.id = ci.chunk_id
-       WHERE ci.kind = 'time_bucket' AND ci.value = $1
+       WHERE ci.kind = 'time_bucket' AND ci.value = ANY($1::text[])
          AND c.retention_class != 'ephemeral'
          AND c.agent_id = $3
-       ORDER BY c.created_at DESC
+       GROUP BY c.id, c.source, c.source_ref, c.text
+       ORDER BY hits DESC, max(c.created_at) DESC
        LIMIT $2`,
-    [ctx.timeBucket, k, aid],
+    [buckets, k, aid],
   );
-  // All matched buckets are equally good; flat 0.7.
+  const max = rows.rows.reduce((m, r) => Math.max(m, r.hits), 0);
+  // Score: more bucket hits = higher (chunk mentioned across multiple days of
+  // a "last week" query is more relevant than a chunk only mentioned once).
+  // Floor at 0.6 so even single-hit time matches still register meaningfully.
   return map(
-    rows.rows.map((r) => build(r, 1, 0.7)),
+    rows.rows.map((r) => build(r, r.hits, max === 0 ? 0 : 0.6 + 0.4 * (r.hits / max))),
     "time_bucket",
   );
 }
@@ -291,6 +301,109 @@ export async function routeAnchor(
   );
 }
 
+/* -------------------------------- graph_walk ------------------------------- */
+
+/**
+ * 1-hop graph traversal over `structured.relations`, seeded from entities the
+ * query implicates. Surfaces chunks that don't textually mention the query
+ * subject but mention something the subject is related to.
+ *
+ * Two seed sources, OR'd together:
+ *   1. Explicit `ctx.entityIds` (caller pre-resolved)
+ *   2. Auto-resolved: entities whose `canonical_name` or `aliases` match any
+ *      `ctx.conceptTags` (deterministic — pg_trgm % similarity AND alias =).
+ *
+ * For each seed entity, find its neighbors via `subject_id` / `object_id`
+ * relations. Then find chunks indexed under those neighbor ids in
+ * `chunk_indexes (kind='entity_ref')`. Score by neighbor confidence and
+ * number of distinct neighbor hits per chunk.
+ *
+ * Returns empty when there are no seeds and no matching entities — cheap
+ * to call unconditionally, so the router always fans it out.
+ */
+export async function routeGraphWalk(
+  pool: Pool,
+  ctx: RecallContext,
+): Promise<RouteCandidate[]> {
+  const k = ctx.perRouteK ?? DEFAULT_K;
+  const aid = ctx.agentId ?? "main";
+  const seedTags = ctx.conceptTags ?? [];
+  const explicitSeeds = ctx.entityIds ?? [];
+
+  // Step 1: resolve seed entity ids — explicit + concept-tag fuzzy match.
+  // We do this in-route (one extra query) instead of pre-computing in the
+  // router, because it's strictly opt-in for graph_walk and skipping it
+  // when both seed sources are empty avoids any DB hit.
+  if (explicitSeeds.length === 0 && seedTags.length === 0) {return [];}
+
+  let seeds: string[] = [...explicitSeeds];
+  if (seedTags.length > 0) {
+    const resolved = await pool.query<{ id: string }>(
+      `SELECT id FROM structured.entities
+         WHERE deleted_at IS NULL
+           AND (
+             canonical_name = ANY($1::text[])
+             OR aliases && $1::text[]
+             OR EXISTS (
+               SELECT 1 FROM unnest($1::text[]) AS tag
+               WHERE canonical_name % tag
+             )
+           )
+         LIMIT 16`,
+      [seedTags],
+    );
+    for (const r of resolved.rows) {
+      if (!seeds.includes(r.id)) {seeds.push(r.id);}
+    }
+  }
+  if (seeds.length === 0) {return [];}
+
+  // Step 2: 1-hop neighbors via relations, then chunks indexed under those.
+  // GROUP BY neighbor + chunk and aggregate so a chunk that gets reached
+  // via multiple neighbors scores higher than one reached via just one.
+  const rows = await pool.query<RouteRow & { neighbors: number; avg_conf: number }>(
+    `WITH neighbors AS (
+       SELECT DISTINCT
+         CASE WHEN r.subject_id = ANY($1::uuid[]) THEN r.object_id
+              ELSE r.subject_id
+         END AS neighbor_id,
+         r.confidence
+       FROM structured.relations r
+       WHERE (r.subject_id = ANY($1::uuid[]) OR r.object_id = ANY($1::uuid[]))
+         AND (r.ended_at IS NULL OR r.ended_at > now() - interval '180 days')
+     )
+     SELECT c.id AS chunk_id, c.source, c.source_ref, c.text,
+            count(DISTINCT n.neighbor_id)::int AS neighbors,
+            avg(n.confidence)::float AS avg_conf
+       FROM neighbors n
+       JOIN semantic.chunk_indexes ci
+         ON ci.kind = 'entity_ref' AND ci.value = n.neighbor_id::text
+       JOIN semantic.chunks c ON c.id = ci.chunk_id
+      WHERE n.neighbor_id IS NOT NULL
+        AND c.retention_class != 'ephemeral'
+        AND c.agent_id = $3
+      GROUP BY c.id, c.source, c.source_ref, c.text
+      ORDER BY neighbors DESC, avg_conf DESC
+      LIMIT $2`,
+    [seeds, k, aid],
+  );
+  if (rows.rows.length === 0) {return [];}
+  const maxN = rows.rows.reduce((m, r) => Math.max(m, r.neighbors), 0);
+  return map(
+    rows.rows.map((r) =>
+      build(
+        r,
+        r.neighbors,
+        // Composite: neighbor count (0..1) × avg confidence (0..1).
+        // A chunk reached via 3 distinct related entities each at 0.9
+        // confidence beats a chunk reached via 1 neighbor at 1.0.
+        maxN === 0 ? 0 : (r.neighbors / maxN) * Math.min(1, Math.max(0, r.avg_conf)),
+      ),
+    ),
+    "graph_walk",
+  );
+}
+
 /* ---------------------------------- merge ---------------------------------- */
 
 export type MergeWeights = Partial<Record<RouteName, number>>;
@@ -309,6 +422,11 @@ const DEFAULT_WEIGHTS: Required<MergeWeights> = {
   // concept+semantic still beats older category-only matches via
   // multi-route compound scoring. Category is a tie-breaker, not a driver.
   category: 0.3,
+  // Graph walk: borrowed strength from neighbor entities. Slightly below
+  // direct entity_ref (1.0) because a 1-hop inference is weaker than a
+  // textual mention, but above concept_tag because the relation is
+  // explicit in the structured store, not just a substring match.
+  graph_walk: 0.9,
 };
 
 export type MergedCandidate = RouteCandidate & {

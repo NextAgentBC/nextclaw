@@ -106,7 +106,7 @@ export async function healthcheck(cfg: ResolvedPoolConfig): Promise<HealthResult
     const ext = await pool.query<{ extname: string; extversion: string }>(
       "SELECT extname, extversion FROM pg_extension WHERE extname IN ('vector','pg_trgm','btree_gin')",
     );
-    const exts = new Map(ext.rows.map((r) => [r.extname, r.extversion]));
+    const exts = new Map<string, string>(ext.rows.map((r) => [r.extname, r.extversion]));
     return {
       ok: true,
       latencyMs: Date.now() - start,
