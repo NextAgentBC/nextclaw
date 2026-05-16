@@ -25,6 +25,8 @@
 
 import type { Pool } from "pg";
 import type { ResolvedMemoryPostgresConfig } from "../config.js";
+import type { EmbeddingClient } from "../embedding/client.js";
+import { tryCachePrecheck } from "./cache-precheck.js";
 import { logDecision, loadModeratorState, saveModeratorState } from "./state.js";
 import { runOneCycle, type ModeratorLlm } from "./runner.js";
 import { executeDecision } from "./side-effects.js";
@@ -35,6 +37,9 @@ export type ModeratorServiceConfig = {
   enabled: boolean;
   /** LLM client (typically built via `buildModeratorLlm`). */
   llm: ModeratorLlm;
+  /** Embedding client — needed for cache.qa L2 semantic lookup before
+   *  the Moderator decision. Skips Gemini entirely on cache hits. */
+  embedding: EmbeddingClient;
   /** Telegram bot token, from openclaw `channels.telegram.botToken`. */
   telegramBotToken: string;
   /** Bot owner user id (for escalation), from `commands.ownerAllowFrom[0]`. */
@@ -154,6 +159,61 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
       const status = await readScopeStatus(config.pool, scopeKey);
       if (status === "paused" || status === "archived") {
         config.logger.info(`moderator: scope ${scopeKey} is ${status}, skipping`);
+        return;
+      }
+
+      // 2.5. Cache pre-check (L0 in-process / L1 PG exact / L2 PG semantic).
+      //      On hit: send the cached answer directly and SKIP the LLM call.
+      //      The bulk of repeat-question savings lives here (~50ms vs 6s,
+      //      0 vs 1500 Gemini tokens).
+      const precheck = await tryCachePrecheck(
+        { pool: config.pool, embedding: config.embedding, agentId: "main" },
+        {
+          scopeKey,
+          questionText: trigger.text,
+          viewer: { userId: senderUserId, chatId },
+        },
+      );
+      if (precheck.hit) {
+        config.logger.info(
+          `moderator: scope=${scopeKey} CACHE HIT (${precheck.hitKind} sim=${precheck.similarity.toFixed(2)}) ` +
+            `latency=${precheck.latencyMs}ms — skipping LLM`,
+        );
+        // Send the cached answer.
+        const sendRes = await tg.sendMessage({
+          chatId,
+          text: precheck.answer,
+          messageThreadId,
+        });
+        if (!sendRes.ok) {
+          config.logger.warn(`moderator: cache-hit send failed: ${sendRes.error}`);
+        }
+        // Persist the inbound + a synthetic "cache-hit" decision row for audit.
+        await saveModeratorState(config.pool, "main", scopeKey, {
+          ...state,
+          recentMessages: [...state.recentMessages, trigger].slice(-50),
+          messagesSinceLastReview: state.messagesSinceLastReview + 1,
+        }, {
+          bumpMessageCount: 1,
+          bumpDecisionCount: 0, // cache-hit isn't a "decision" — no LLM ran
+          lastMessageAt: new Date(),
+        });
+        await logDecision(config.pool, {
+          agentId: "main",
+          scopeKey,
+          triggerKind: "message",
+          triggerUserId: senderUserId,
+          triggerText: trigger.text,
+          decision: {
+            action: "answer-direct",
+            rationale: `cache hit (${precheck.hitKind}, sim=${precheck.similarity.toFixed(2)}, id=${precheck.cacheId})`,
+          },
+          model: `cache:${precheck.hitKind}`,
+          inputTokens: 0,
+          outputTokens: 0,
+          latencyMs: precheck.latencyMs,
+          workersSpawned: 0,
+        });
         return;
       }
 

@@ -406,9 +406,18 @@ export default definePluginEntry({
                 "memory-postgres: moderator.enabled=true but dashboard.tokenEnv unresolved — service NOT started (memory-writes would fail).",
               );
             } else {
+              // Embedding client for cache.qa L2 semantic lookup (pre-Moderator)
+              const embeddingClient = buildEmbeddingClientFromConfig({
+                baseUrl: cfg.embedding.baseUrl,
+                model: cfg.embedding.model,
+                apiKeyEnv: cfg.embedding.apiKeyEnv,
+                format: cfg.embedding.format,
+                path: cfg.embedding.path,
+              });
               moderatorHandle = startModeratorService({
                 enabled: true,
                 llm,
+                embedding: embeddingClient,
                 telegramBotToken: botToken,
                 ownerUserId,
                 ingestUrl: `http://${cfg.dashboard.host}:${cfg.dashboard.port}/api/ingest`,
