@@ -54,21 +54,27 @@
 git clone https://github.com/openclaw/openclaw.git ~/openclaw
 cd ~/openclaw && pnpm install && pnpm build
 
-# 2. Bring up Postgres + pgvector
+# 2. Bring up Postgres + pgvector (docker compose included)
 git clone https://github.com/NextAgentBC/nextclaw.git ~/openclaw/extensions/memory-postgres
-cd ~/openclaw/extensions/memory-postgres/dev
-docker compose up -d
+cd ~/openclaw/extensions/memory-postgres/dev && docker compose up -d
 
-# 3. Bring up an embedding endpoint (one option among many)
-curl -fsSL https://ollama.com/install.sh | sh
-ollama serve &
-ollama pull nomic-embed-text
+# 3. Get a free Jina embedding key (no card, 1M tokens)
+#    https://jina.ai/embeddings/  → copy the key
+export JINA_API_KEY=jina_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # 4. Build the plugin
 cd ~/openclaw && pnpm install && pnpm build
 
-# 5. Configure ~/.openclaw/openclaw.json (see docs/INSTALL.md ⑤)
-# 6. Generate dashboard token and start
+# 5. Configure ~/.openclaw/openclaw.json — minimal:
+#      "plugins": {
+#        "slots": { "memory": "memory-postgres" },
+#        "entries": { "memory-postgres": { "enabled": true, "config": {
+#          "postgres": { "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw" }
+#        }}}
+#      }
+#    (embedding block is OPTIONAL — defaults to Jina free with JINA_API_KEY)
+
+# 6. Start
 export NEXTCLAW_DASH_TOKEN=$(openssl rand -hex 24)
 pnpm openclaw gateway start
 
@@ -81,6 +87,16 @@ curl -sS -X POST http://127.0.0.1:8765/api/ingest \
 
 For the **0 → 1 walkthrough** with troubleshooting, persona files, and
 a Discord bot setup, see **[docs/INSTALL.md](docs/INSTALL.md)**.
+
+> **Want to self-host the embedder instead of Jina?** Run Ollama locally
+> and set `"embedding": { "format": "ollama" }` — the rest of the
+> embedding block fills itself in from per-format defaults. See
+> [docs/CONFIG.md#embedding](docs/CONFIG.md#embedding).
+>
+> ⚠️ **Embedding dimension is one-way.** It's auto-detected on first ingest
+> and locked into the HNSW index. Switching from `jina-embeddings-v3` (1024d)
+> to `qwen3-embedding:4b` (4096d) requires `TRUNCATE semantic.chunks` and
+> re-ingesting everything. Pick the model you can live with for a while.
 
 ## Documentation
 
@@ -96,7 +112,8 @@ a Discord bot setup, see **[docs/INSTALL.md](docs/INSTALL.md)**.
 - **OpenClaw** `>= 2026.4.25`
 - **Node** `>= 22`
 - **Postgres** `>= 16` with **pgvector** `>= 0.7.0` (HNSW)
-- **Embedding**: any OpenAI- or Ollama-compat endpoint. Tested with `nomic-embed-text` (768d), `qwen3-embedding:0.6b` (1024d), `qwen3-embedding:4b` (4096d). Dimension is detected on first embed and locked into the HNSW index.
+- **Embedding**: Jina (default, free tier), any OpenAI- or Ollama-compat endpoint. Tested with `jina-embeddings-v3` (1024d, default), `nomic-embed-text` (768d), `qwen3-embedding:0.6b` (1024d), `qwen3-embedding:4b` (4096d). Dimension is detected on first embed and **locked** into the HNSW index — switching models means re-ingesting.
+- **Reflection LLM** (optional): any OpenAI-compat chat endpoint, or native Gemini API (e.g. via Google's free tier or a Tailscale credential broker). Disabled by default.
 
 ## Performance reference
 

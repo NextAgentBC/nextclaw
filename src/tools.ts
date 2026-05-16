@@ -9,6 +9,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
 import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig, validateConfig } from "./config.js";
 import { buildEmbeddingClientFromConfig } from "./embedding/client.js";
+import { forgetChunk, updateChunk } from "./edit/operations.js";
 import { ingestOne } from "./ingest/pipeline.js";
 import { recall } from "./recall/router.js";
 import { ensureHnswIndex, migrate } from "./storage/migrate.js";
@@ -86,6 +87,44 @@ type StoreParams = {
   branch?: string;
   pr?: string;
   file?: string;
+};
+
+const UPDATE_PARAMS = {
+  type: "object",
+  additionalProperties: false,
+  required: ["chunkId"],
+  properties: {
+    chunkId: { type: "string", description: "ID of the chunk to update (from prior memory_search result)." },
+    text: { type: "string", minLength: 1, description: "Replacement text. When set, the chunk is re-embedded." },
+    importance: { type: "number", minimum: 0, maximum: 1, description: "Override importance (0..1)." },
+    pinned: { type: "boolean", description: "When true → retention_class='pinned' (never decays). When false → 'standard'." },
+    reason: { type: "string", description: "Why you're updating this — recorded in the audit row." },
+  },
+} as const;
+
+const FORGET_PARAMS = {
+  type: "object",
+  additionalProperties: false,
+  required: ["chunkId"],
+  properties: {
+    chunkId: { type: "string", description: "ID of the chunk to forget (from prior memory_search result)." },
+    hardDelete: { type: "boolean", description: "When true, fully delete (breaks cold-gist back-references). When false (default), soft-trash so it stops appearing in recall but can be audited." },
+    reason: { type: "string", description: "Why you're forgetting this — recorded in the audit row." },
+  },
+} as const;
+
+type UpdateParams = {
+  chunkId: string;
+  text?: string;
+  importance?: number;
+  pinned?: boolean;
+  reason?: string;
+};
+
+type ForgetParams = {
+  chunkId: string;
+  hardDelete?: boolean;
+  reason?: string;
 };
 
 /**
@@ -233,6 +272,105 @@ export function buildSearchTool(args: { config: OpenClawConfig; sessionKey?: str
             score: c.combinedScore,
             hits: c.hits,
           })),
+        },
+      };
+    },
+  };
+  return tool as unknown as AnyAgentTool;
+}
+
+export function buildUpdateTool(args: { config: OpenClawConfig; sessionKey?: string }): AnyAgentTool {
+  const tool = {
+    name: "memory_update",
+    label: "Memory Update",
+    description:
+      "Rewrite or re-classify a chunk you previously stored. Use when you "
+      + "learn the fact has changed (Yao's preferred language switched), when "
+      + "you want to pin something important (importance=1.0 + pinned=true), or "
+      + "when an earlier write was incorrect. Pass the chunkId from a recent "
+      + "memory_search result. Per-agent isolation enforced.",
+    parameters: UPDATE_PARAMS as unknown as AnyAgentTool["parameters"],
+    async execute(this: void, _toolCallId: string, params: unknown): Promise<{ content: unknown; details: unknown }> {
+      const p = params as UpdateParams;
+      const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+      const agentId = agentIdFromSessionKey(args.sessionKey);
+      const outcome = await updateChunk(
+        { cfg, pool, embedding },
+        {
+          chunkId: p.chunkId,
+          agentId,
+          text: p.text,
+          importance: p.importance ?? (p.pinned === true ? 1.0 : undefined),
+          retentionClass:
+            p.pinned === true ? "pinned" : p.pinned === false ? "standard" : undefined,
+          reason: p.reason,
+        },
+      );
+
+      if (!outcome.ok) {
+        return {
+          content: [{ type: "text", text: `Update failed: ${outcome.reason}.` }],
+          details: { decision: "rejected", reason: outcome.reason },
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Updated chunk ${outcome.chunkId}${outcome.reEmbedded ? " (re-embedded)" : ""}.`,
+          },
+        ],
+        details: { decision: "updated", chunkId: outcome.chunkId, reEmbedded: outcome.reEmbedded },
+      };
+    },
+  };
+  return tool as unknown as AnyAgentTool;
+}
+
+export function buildForgetTool(args: { config: OpenClawConfig; sessionKey?: string }): AnyAgentTool {
+  const tool = {
+    name: "memory_forget",
+    label: "Memory Forget",
+    description:
+      "Mark a chunk as trash so it stops appearing in recall. Use for "
+      + "outdated facts, mistaken writes, or anything the user explicitly "
+      + "asks you to forget. Default is soft (retention_class='trash') — "
+      + "the chunk still exists for audit but won't surface. Pass "
+      + "hardDelete=true only if the user asks for true deletion. "
+      + "Per-agent isolation enforced.",
+    parameters: FORGET_PARAMS as unknown as AnyAgentTool["parameters"],
+    async execute(this: void, _toolCallId: string, params: unknown): Promise<{ content: unknown; details: unknown }> {
+      const p = params as ForgetParams;
+      const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+      const agentId = agentIdFromSessionKey(args.sessionKey);
+      const outcome = await forgetChunk(
+        { cfg, pool, embedding },
+        {
+          chunkId: p.chunkId,
+          agentId,
+          hardDelete: p.hardDelete === true,
+          reason: p.reason,
+        },
+      );
+
+      if (!outcome.ok) {
+        return {
+          content: [{ type: "text", text: `Forget failed: ${outcome.reason}.` }],
+          details: { decision: "rejected", reason: outcome.reason },
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Forgot chunk ${outcome.chunkId} (mode=${outcome.mode}).`,
+          },
+        ],
+        details: {
+          decision: outcome.mode === "tombstone" ? "tombstoned" : "trashed",
+          chunkId: outcome.chunkId,
+          mode: outcome.mode,
+          deletedRow: outcome.deletedRow,
         },
       };
     },

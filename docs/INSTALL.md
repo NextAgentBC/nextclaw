@@ -55,10 +55,41 @@ docker exec -e PGPASSWORD=nextclaw nextclaw-pg \
 
 ---
 
-## ③ Stand up an embedding endpoint
+## ③ Get an embedding endpoint
 
-nextclaw needs an OpenAI-compatible embeddings endpoint. The simplest is
-**Ollama** running `nomic-embed-text` locally (small, fast, free).
+**Default: Jina free tier — 30 seconds, no card, no GPU.**
+
+1. Go to [jina.ai/embeddings](https://jina.ai/embeddings/) and click "Get API key for free"
+2. Copy the key and export it:
+
+```bash
+export JINA_API_KEY=jina_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+That's it. Verify:
+
+```bash
+curl -sS https://api.jina.ai/v1/embeddings \
+  -H "Authorization: Bearer $JINA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"jina-embeddings-v3","input":["hello"]}' | head -c 200
+# Should return JSON with a "data": [{ "embedding": [...] }] array
+```
+
+`jina-embeddings-v3` is 1024-dim, multilingual (Chinese works well),
+free tier covers 1M tokens per key (≈ 500 days of typical chat use).
+The plugin defaults to this when the `embedding` config block is omitted.
+
+> ⚠️ **Embedding dimension is one-way.** It's auto-detected on first
+> ingest and locked into the HNSW index. Switching from
+> `jina-embeddings-v3` (1024d) to `qwen3-embedding:4b` (4096d) requires
+> `TRUNCATE semantic.chunks RESTART IDENTITY CASCADE` and re-ingesting
+> everything. Pick a model you can live with for a few months.
+
+### Alternative: self-hosted via Ollama (no API, full control)
+
+If you prefer to run the embedder locally — better for privacy, no
+rate limits, but needs ~1–4 GB of RAM/GPU:
 
 ```bash
 # Linux (one-liner installer)
@@ -66,61 +97,27 @@ curl -fsSL https://ollama.com/install.sh | sh
 # macOS: download from https://ollama.com (or: brew install ollama)
 
 ollama serve &                          # background, listens on 127.0.0.1:11434
-ollama pull nomic-embed-text            # 274 MB, takes ~30s on a decent connection
+ollama pull qwen3-embedding:0.6b        # ~1 GB, multilingual, recommended
+# or:  ollama pull nomic-embed-text     # ~274 MB, English-leaning
 ```
 
-Verify:
+Then put `"format": "ollama"` in the embedding block (everything else
+fills in from per-format defaults). See [`docs/CONFIG.md#embedding`](CONFIG.md#embedding).
 
-```bash
-curl -sS http://127.0.0.1:11434/v1/embeddings \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"nomic-embed-text","input":"hello"}' | head -c 200
-# Should return JSON with a "data": [{ "embedding": [...] }] array
-```
+### Alternative: Tailscale credential broker (private fleet, multi-host)
 
-> **Larger / Chinese-friendly alternatives**: if you want better Chinese
-> recall and have GPU memory, swap to `qwen3-embedding:0.6b` (or 4B/8B).
-> The dimension is detected on first embed call and locked into the HNSW
-> index, so picking the dimension up front is **not** required.
-
-### Alternative: hosted embedding (no local model, no GPU)
-
-If you do not want to run a local model, any OpenAI-compatible
-`/v1/embeddings` endpoint works. Two free options as of 2026:
-
-**[Jina AI](https://jina.ai/embeddings/)** — `jina-embeddings-v3`,
-1024-dim, multilingual including Chinese. Free tier: 1M tokens per key
-(non-commercial). Drop-in OpenAI schema:
-
-```bash
-curl -sS https://api.jina.ai/v1/embeddings \
-  -H "Authorization: Bearer $JINA_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"jina-embeddings-v3","input":["hello"]}'
-```
-
-Then in `~/.openclaw/openclaw.json`:
+If you run multiple agents across a Tailscale tailnet and want zero API
+keys on caller hosts, point at an OpenAI-compat proxy on your trusted
+mainserver. Example (replace IP / port with your own):
 
 ```jsonc
 "embedding": {
-  "provider": "jina",
-  "model": "jina-embeddings-v3",
-  "baseUrl": "https://api.jina.ai",
   "format": "openai",
-  "path": "/v1/embeddings",
-  "apiKeyEnv": "JINA_API_KEY",
-  "dims": 1024
+  "baseUrl": "http://100.79.97.110:8800/v1/proxy/local-embed",
+  "model": "qwen3-embedding:0.6b"
+  // apiKeyEnv omitted — broker authenticates via tailnet identity
 }
 ```
-
-**[Google Gemini](https://ai.google.dev/gemini-api/docs/embeddings)** —
-`text-embedding-004`, 768-dim. Continuously renewing free tier (RPM
-limited). Requires an OpenAI-compatible shim or direct Gemini SDK use.
-
-**Multi-key rotation**: if you exceed a single Jina key, a thin proxy
-that rotates between keys on 429 keeps you within free tier. See the
-NextClaw community examples for a small Node proxy that does this while
-exposing a single OpenAI-compatible endpoint.
 
 ---
 
@@ -143,7 +140,31 @@ pnpm build
 
 ## ⑤ Configure `~/.openclaw/openclaw.json`
 
-Create or edit this file:
+Create or edit this file. The **minimal** config — relying entirely on
+defaults — is:
+
+```jsonc
+{
+  "plugins": {
+    "slots": { "memory": "memory-postgres" },
+    "entries": {
+      "memory-postgres": {
+        "enabled": true,
+        "config": {
+          "postgres": { "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw" }
+        }
+      }
+    }
+  }
+}
+```
+
+This boots with: Jina embedding (`JINA_API_KEY` env), default tiers,
+dashboard disabled, no transcript watchers, no reflection. Good enough
+to verify the smoke test in step ⑦.
+
+For a more realistic setup — dashboard on, watchers tailing your agent's
+session JSONL, gemini reflection nightly — copy this:
 
 ```jsonc
 {
@@ -165,14 +186,10 @@ Create or edit this file:
           "postgres": {
             "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw"
           },
-          "embedding": {
-            "provider": "ollama",
-            "model": "nomic-embed-text",
-            "baseUrl": "http://127.0.0.1:11434",
-            "format": "openai",
-            "path": "/v1/embeddings",
-            "maxEmbedChars": 2000
-          },
+          // Embedding block is OPTIONAL — defaults to Jina free-tier.
+          // Uncomment + edit to swap to ollama / openai / proxy:
+          // "embedding": { "format": "ollama" },
+
           "tiers": {
             "t0SizeLimit": 50,
             "t1SizeLimit": 500,
@@ -191,7 +208,18 @@ Create or edit this file:
             "dir": "~/.openclaw/agents/main/sessions",
             "intervalMs": 10000,
             "defaultImportance": 0.35
-          }]
+          }],
+          // Optional: nightly reflection over recent conversations
+          // (writes summary chunks the agent can recall later).
+          // "reflection": {
+          //   "enabled": true,
+          //   "model": {
+          //     "format": "openai",
+          //     "baseUrl": "https://api.openai.com",
+          //     "model": "gpt-4o-mini",
+          //     "apiKeyEnv": "OPENAI_API_KEY"
+          //   }
+          // }
         }
       }
     }

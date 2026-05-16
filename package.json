@@ -1,6 +1,6 @@
 {
   "name": "nextclaw",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Postgres + pgvector long-term memory plugin for OpenClaw — 4-tier recall (T0/T1/T2/T3), multi-key Xinhua-dictionary indexing, deterministic-first ingest, self-tuning loop, and a real-time dashboard.",
   "type": "module",
   "license": "Apache-2.0",

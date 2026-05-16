@@ -113,6 +113,43 @@ export type MemoryPostgresConfig = {
    * to compare gpt-5.5 vs qwen3.6-35B etc. without affecting the live reply.
    */
   shadowComparators?: ShadowComparatorConfig[];
+  /**
+   * Daily reflection worker. Reads recent conversation chunks per agent
+   * and asks an LLM to produce: (1) a one-paragraph reflection chunk
+   * (`kind='reflection'`), and (2) a list of profile bullets (`kind='profile'`)
+   * that get primed into T0 on every subsequent recall — MemGPT-style
+   * "core memory". Disabled by default; opt in by setting `enabled: true`
+   * and pointing `model` at an OpenAI-compat or native-Gemini endpoint.
+   */
+  reflection?: ReflectionConfig;
+};
+
+export type ReflectionConfig = {
+  /** Master switch. Default false. */
+  enabled?: boolean;
+  /** How often to run the worker. Default 24h, min 1h. */
+  intervalMs?: number;
+  /** How far back to look for conversation chunks per run. Default 24h. */
+  lookbackHours?: number;
+  /** Cap total input chars to the LLM (truncates oldest to fit). Default 8000. */
+  maxInputChars?: number;
+  /** LLM endpoint. Two supported formats — see below. */
+  model: ReflectionModelConfig;
+};
+
+export type ReflectionModelConfig = {
+  /** Wire format. `openai` = standard /v1/chat/completions.
+   *  `gemini` = Google native /v1beta/models/<model>:generateContent
+   *  (also works when proxied through a Tailscale credential broker). */
+  format: "openai" | "gemini";
+  /** Base URL (no path). For credbroker gemini, e.g.
+   *  http://100.79.97.110:8800/v1/proxy/gemini . */
+  baseUrl: string;
+  /** Model id. e.g. `gpt-4o-mini`, `gemini-2.5-flash`. */
+  model: string;
+  /** Optional env var holding a bearer token / api key. Skip for credbroker
+   *  setups that authenticate via Tailscale identity. */
+  apiKeyEnv?: string;
 };
 
 export type ShadowComparatorConfig = {
@@ -226,6 +263,20 @@ export type ResolvedMemoryPostgresConfig = {
   gitWatchers: ResolvedGitWatcher[];
   transcriptWatchers: ResolvedTranscriptWatcher[];
   shadowComparators: ResolvedShadowComparator[];
+  reflection: ResolvedReflectionConfig;
+};
+
+export type ResolvedReflectionConfig = {
+  enabled: boolean;
+  intervalMs: number;
+  lookbackHours: number;
+  maxInputChars: number;
+  model: {
+    format: "openai" | "gemini";
+    baseUrl: string;
+    model: string;
+    apiKeyEnv?: string;
+  };
 };
 
 export type ResolvedShadowComparator = {
@@ -352,6 +403,30 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
     gitWatchers: (raw.gitWatchers ?? []).map(resolveGitWatcher),
     transcriptWatchers: (raw.transcriptWatchers ?? []).map(resolveTranscriptWatcher),
     shadowComparators: (raw.shadowComparators ?? []).map(resolveShadowComparator),
+    reflection: resolveReflectionConfig(raw.reflection),
+  };
+}
+
+function resolveReflectionConfig(
+  raw: ReflectionConfig | undefined,
+): ResolvedReflectionConfig {
+  // Defaults are inert (`enabled=false`). When the user enables it without
+  // a model block, we still produce a sane shape but the daemon won't start.
+  const block = raw ?? ({} as ReflectionConfig);
+  const modelBlock = block.model ?? ({} as ReflectionModelConfig);
+  const format = modelBlock.format === "gemini" ? "gemini" : "openai";
+  return {
+    enabled: bool(block.enabled, false),
+    intervalMs: Math.max(60 * 60 * 1000, num(block.intervalMs, 24 * 60 * 60 * 1000)),
+    lookbackHours: Math.max(1, num(block.lookbackHours, 24)),
+    maxInputChars: Math.max(500, num(block.maxInputChars, 8000)),
+    model: {
+      format,
+      baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : "",
+      model: isString(modelBlock.model) ? modelBlock.model
+        : format === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini",
+      apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
+    },
   };
 }
 

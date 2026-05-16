@@ -14,7 +14,12 @@ export type RouteName =
   | "entity_ref"
   | "time_bucket"
   | "anchor"
-  | "category";
+  | "category"
+  // 1-hop graph walk over structured.relations starting from query-resolved
+  // entities. Borrows the GraphRAG idea: when "Yao Song" shows up in the
+  // query, surface chunks that mention people / projects / files he's
+  // related to, even if those chunks never literally said "Yao Song".
+  | "graph_walk";
 
 export type RouteCandidate = {
   chunkId: string;
@@ -31,8 +36,15 @@ export type RouteCandidate = {
 
 export type RecallContext = {
   query: string;
-  /** Time anchor (today, last week, ...). */
+  /** Single time anchor (YYYY-MM-DD). Caller-explicit. */
   timeBucket?: string;
+  /**
+   * Multiple time buckets — typically populated by the router's temporal
+   * inference (e.g. "上周" → 7 bucket strings). When set, `routeTimeBucket`
+   * unions across all of them. When `timeBucket` is also set, the buckets
+   * are merged.
+   */
+  timeBuckets?: string[];
   /** Pre-resolved anchor values (cwd, branch, pr_number, file_path, session_id). */
   anchors?: {
     cwd?: string;

@@ -28,34 +28,65 @@ mirrors it with explanations.
 
 ## `embedding`
 
+The entire `embedding` block is **optional**. Omit it (or pass `{}`)
+to get Jina free-tier defaults. Set `format` to switch families; the
+remaining fields fill in from per-format defaults.
+
 ```jsonc
 "embedding": {
-  "provider": "ollama",               // "ollama" | "openai" | freeform string
-  "model": "nomic-embed-text",        // required
-  "baseUrl": "http://127.0.0.1:11434",
-  "apiKeyEnv": "OPENAI_API_KEY",      // optional; reads env var on each call
-  "format": "openai",                 // "openai" | "ollama" wire format
-  "path": "/v1/embeddings",
-  "dims": 768,                        // optional; auto-detected on first call if omitted
-  "maxEmbedChars": 2000               // truncate text before embed
+  "format":     "jina",                          // "jina" (default) | "openai" | "ollama"
+  "provider":   "jina",                          // informational tag, auto-filled from format
+  "model":      "jina-embeddings-v3",            // auto-filled from format
+  "baseUrl":    "https://api.jina.ai",           // auto-filled from format
+  "apiKeyEnv":  "JINA_API_KEY",                  // auto-filled from format
+  "path":       "/v1/embeddings",                // auto-filled from format
+  "dims":       1024,                            // optional; auto-detected on first call
+  "maxEmbedChars": 2000
 }
 ```
 
 | Field | Default | Notes |
 |---|---|---|
-| `provider` | required | Label only — used for logging |
-| `model` | required | Sent in the request body. For Ollama: the pulled model name |
-| `baseUrl` | required | Endpoint host, no path |
-| `apiKeyEnv` | none | Env var name (not the value) holding a Bearer token. Optional |
-| `format` | `"ollama"` | OpenAI's `/v1/embeddings` wraps response differently from Ollama's `/api/embeddings`. Pick the one your endpoint speaks |
-| `path` | `/api/embeddings` (ollama) or `/v1/embeddings` (openai) | Endpoint path |
-| `dims` | auto-detect on first call | Locks the HNSW index dimension. Don't change after first chunks are written |
-| `maxEmbedChars` | 2000 | Truncates text **before** embedding. Full text is still stored in `chunks.text` and recoverable via tsvector / trgm. Reduces GPU time on long replies by 50–70% with negligible recall loss |
+| `format` | `"jina"` | Wire format. `jina` = Jina's `/v1/embeddings` with asymmetric `task=retrieval.passage\|.query`. `openai` = standard `/v1/embeddings`. `ollama` = local `/api/embed` |
+| `provider` | from format | Label only — used for logging |
+| `model` | from format | Sent in the request body. Format defaults: `jina-embeddings-v3` / `text-embedding-3-small` / `qwen3-embedding:4b` |
+| `baseUrl` | from format | Endpoint host, no path. Format defaults: `https://api.jina.ai` / `https://api.openai.com` / `http://127.0.0.1:11434` |
+| `apiKeyEnv` | from format | Env var name (not the value) holding a Bearer token. Format defaults: `JINA_API_KEY` / `OPENAI_API_KEY` / (none for ollama) |
+| `path` | from format | Endpoint path. Format defaults: `/v1/embeddings` for jina+openai, `/api/embed` for ollama |
+| `dims` | auto-detect on first call | Locks the HNSW index dimension. **Cannot be changed without re-ingesting.** |
+| `maxEmbedChars` | 2000 | Truncates text **before** embedding. Full text is still stored in `chunks.text` and recoverable via tsvector / trgm. Reduces embedding latency on long replies by 50–70% with negligible recall loss |
 
-**Tuning**: if you have GPU memory, swap `nomic-embed-text` (768d) for
-`qwen3-embedding:0.6b` (1024d) or `qwen3-embedding:4b` (4096d) for
-better Chinese recall. The HNSW dim is detected and locked on first
-embed call, so just clear the chunks table when changing models.
+**⚠️ Dim lock.** The HNSW index records the dim on first embed. Switching
+from `jina-embeddings-v3` (1024d) to `qwen3-embedding:4b` (4096d) (or any
+other dim change) requires:
+```sql
+TRUNCATE semantic.chunks RESTART IDENTITY CASCADE;
+TRUNCATE cache.embeddings;
+DROP INDEX IF EXISTS semantic.chunks_embedding_hnsw;
+```
+…then restart the gateway. The migration runner rebuilds the HNSW at the
+new dim. Treat this as a one-way decision per deployment.
+
+**Frictionless recipe — Jina free.** Get a key at jina.ai/embeddings,
+`export JINA_API_KEY=...`, and omit the `embedding` block entirely.
+
+**Self-hosted recipe — Ollama.** Run `ollama serve` locally, then:
+```jsonc
+"embedding": { "format": "ollama" }
+```
+Model defaults to `qwen3-embedding:4b`; override `model` to use a
+smaller one (`qwen3-embedding:0.6b` for fast 1024d, `nomic-embed-text`
+for tiny 768d English-leaning).
+
+**Multi-host recipe — credential broker.** If you run a Tailscale-only
+OpenAI-compat proxy that injects API keys server-side, point at it:
+```jsonc
+"embedding": {
+  "format": "openai",
+  "baseUrl": "http://100.79.97.110:8800/v1/proxy/local-embed",
+  "model": "qwen3-embedding:0.6b"
+}
+```
 
 ---
 

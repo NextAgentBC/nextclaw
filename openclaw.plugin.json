@@ -554,6 +554,54 @@
             }
           }
         }
+      },
+      "reflection": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Daily LLM consolidation pass. Produces a `kind='reflection'` summary chunk plus optional `kind='profile'` bullets that get primed into T0 on every recall (MemGPT-style core memory). Off by default.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "intervalMs": {
+            "type": "number",
+            "minimum": 3600000,
+            "description": "How often to run. Min 1h."
+          },
+          "lookbackHours": {
+            "type": "number",
+            "minimum": 1,
+            "description": "Window of conversation chunks the LLM gets to read."
+          },
+          "maxInputChars": {
+            "type": "number",
+            "minimum": 500,
+            "description": "Cap on prompt body. Oldest chunks truncate to fit."
+          },
+          "model": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["format", "baseUrl"],
+            "properties": {
+              "format": {
+                "type": "string",
+                "enum": ["openai", "gemini"],
+                "description": "openai = /v1/chat/completions. gemini = native /v1beta/models/<model>:generateContent (also valid behind a Tailscale credential broker proxy)."
+              },
+              "baseUrl": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "apiKeyEnv": {
+                "type": "string",
+                "description": "Optional env var holding a bearer/API key. Skip for credbroker setups that auth via Tailscale identity."
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -564,9 +612,12 @@
     "tools": [
       "memory_search",
       "memory_store",
+      "memory_update",
+      "memory_forget",
       "dashboard",
       "tuning",
-      "compactor"
+      "compactor",
+      "reflection"
     ]
   }
 }
