@@ -1,6 +1,9 @@
 {
   "id": "memory-postgres",
   "activation": {
+    "onStartup": true
+  },
+  "activation": {
     "onStartup": false
   },
   "kind": "memory",

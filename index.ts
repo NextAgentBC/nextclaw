@@ -104,6 +104,25 @@ export default definePluginEntry({
       { names: ["memory_forget"] },
     );
 
+    // Moderator event hook: must be registered at the SYNCHRONOUS top
+    // of register() so openclaw wires it before any messages route.
+    // The actual moderatorHandle is created inside registerService below
+    // (it needs pg pool + llm client + telegram token which only become
+    // available after start(ctx) fires). The hook captures the handle
+    // by closure and no-ops until start() completes.
+    let activeModeratorHandle: ModeratorServiceHandle | null = null;
+    api.on("message_received", async (event, hookCtx) => {
+      if (!activeModeratorHandle) {return;}
+      try {
+        activeModeratorHandle.onMessageReceived(
+          event as Parameters<ModeratorServiceHandle["onMessageReceived"]>[0],
+          hookCtx as Parameters<ModeratorServiceHandle["onMessageReceived"]>[1],
+        );
+      } catch (err) {
+        api.logger.warn(`memory-postgres: moderator hook threw: ${(err as Error).message}`);
+      }
+    });
+
     /**
      * Background service: dashboard + scheduled workers.
      *
@@ -382,15 +401,9 @@ export default definePluginEntry({
                 logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
                 debounceMs: cfg.moderator.debounceMs,
               });
-              // Hook openclaw's telegram message_received event.
-              // Same surface thread-ownership uses; per-channel id check
-              // filters non-telegram channels inside the handler.
-              api.on("message_received", async (event: unknown, hookCtx: unknown) => {
-                moderatorHandle?.onMessageReceived(
-                  event as Parameters<NonNullable<typeof moderatorHandle>["onMessageReceived"]>[0],
-                  hookCtx as Parameters<NonNullable<typeof moderatorHandle>["onMessageReceived"]>[1],
-                );
-              });
+              // Bind the closure variable so the top-level api.on hook
+              // starts forwarding events from now on.
+              activeModeratorHandle = moderatorHandle;
               api.logger.info(
                 `memory-postgres: moderator service started — model=${cfg.moderator.model.format}:${cfg.moderator.model.model} ` +
                   `debounceMs=${cfg.moderator.debounceMs} owner=${ownerUserId ?? "(none)"}`,
@@ -440,6 +453,7 @@ export default definePluginEntry({
           try { moderatorHandle.stop(); } catch { /* ignore */ }
           moderatorHandle = null;
         }
+        activeModeratorHandle = null;
         if (moderatorEventUnsub) {
           try { moderatorEventUnsub(); } catch { /* ignore */ }
           moderatorEventUnsub = null;
