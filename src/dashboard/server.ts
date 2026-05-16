@@ -463,6 +463,73 @@ async function handleCacheStatsRoute(res: ServerResponse, pool: Pool): Promise<v
   sendJson(res, 200, { ok: true, byTopic: rows });
 }
 
+async function handleCacheRecent(res: ServerResponse, pool: Pool): Promise<void> {
+  // Top entries by use_count for the dashboard "popular Q&A" panel.
+  const r = await pool.query<{
+    id: string;
+    question_text: string;
+    answer_text: string;
+    topic_tag: string | null;
+    use_count: number;
+    upvotes: number;
+    downvotes: number;
+    scope_visibility: string;
+    scope_chat_id: string | null;
+    source: string;
+    source_doc_id: string | null;
+    last_used_at: Date | null;
+  }>(
+    `SELECT id, question_text, answer_text, topic_tag,
+            use_count, upvotes, downvotes, scope_visibility, scope_chat_id,
+            source, source_doc_id, last_used_at
+       FROM cache.qa
+      WHERE agent_id = 'main' AND NOT invalidated AND cacheable
+      ORDER BY use_count DESC, (upvotes - downvotes) DESC, created_at DESC
+      LIMIT 50`,
+  );
+  sendJson(res, 200, {
+    ok: true,
+    entries: r.rows.map((row) => ({
+      id: row.id,
+      question: row.question_text,
+      answer: row.answer_text.length > 240 ? row.answer_text.slice(0, 237) + "..." : row.answer_text,
+      topicTag: row.topic_tag,
+      useCount: row.use_count,
+      net: row.upvotes - row.downvotes,
+      scope: row.scope_chat_id ? `chat:${row.scope_chat_id}` : row.scope_visibility,
+      source: row.source_doc_id ? `${row.source}:${row.source_doc_id}` : row.source,
+      lastUsedAt: row.last_used_at,
+    })),
+  });
+}
+
+async function handleKbList(res: ServerResponse): Promise<void> {
+  // Read the most-recent N entries from the KB upload audit log.
+  // Source of truth lives under OPENCLAW_KB_ROOT / _meta / upload-log.jsonl.
+  // We don't hold the log open — read-then-close keeps the endpoint cheap.
+  const kbRoot = process.env.OPENCLAW_KB_ROOT
+    || path.join(homedir(), ".openclaw", "kb");
+  const logPath = path.join(kbRoot, "_meta", "upload-log.jsonl");
+  let raw = "";
+  try {
+    raw = await readFile(logPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      sendJson(res, 500, { ok: false, error: `read kb log: ${(err as Error).message}` });
+      return;
+    }
+    raw = "";
+  }
+  const lines = raw.split(/\n+/).filter((l) => l.trim().length > 0);
+  // Newest last; show last 100, newest first.
+  const recent = lines.slice(-100).reverse();
+  const entries: unknown[] = [];
+  for (const l of recent) {
+    try {entries.push(JSON.parse(l));} catch { /* skip malformed */ }
+  }
+  sendJson(res, 200, { ok: true, entries, total: lines.length, kbRoot });
+}
+
 async function handleModelCompare(res: ServerResponse, pool: Pool): Promise<void> {
   // Aggregates per challenger model, last 24h.
   const agg = await pool.query(
@@ -713,6 +780,12 @@ export async function startDashboardServer(
           return;
         case "/api/cache/stats":
           await handleCacheStatsRoute(res, pool);
+          return;
+        case "/api/cache/recent":
+          await handleCacheRecent(res, pool);
+          return;
+        case "/api/kb/list":
+          await handleKbList(res);
           return;
         default:
           send(res, 404, "not found", "text/plain");
