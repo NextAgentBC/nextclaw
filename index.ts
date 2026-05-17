@@ -465,6 +465,7 @@ export default definePluginEntry({
                 ingestToken,
                 cfg,
                 pool,
+                agentId: cfg.moderator.agentId,
                 logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
                 debounceMs: cfg.moderator.debounceMs,
               });

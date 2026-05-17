@@ -214,10 +214,14 @@ const WEB_SEARCH_SNIPPET_CHARS = 400;
  *      from `cfg.credbroker.tavilyUrl`) — preferred path.
  *   2. `NEXTCLAW_WEB_SEARCH_URL` env override.
  *   3. `TAVILY_API_KEY` env → direct api.tavily.com.
- *   4. Hard-coded fallback (kept so an ill-configured deployment still
- *      tries something; logged as a soft warning the operator should fix).
+ *
+ * Returns null when web_search is NOT configured on this deployment. The
+ * caller (execWebSearch) then returns an honest error to the LLM rather
+ * than silently hitting a hardcoded URL that only works in one developer's
+ * tailnet — see the original bug: a placeholder URL pointing at the
+ * author's home network would time out for everyone else.
  */
-function resolveWebSearchEndpoint(fromDeps: string | null): { url: string; apiKey?: string } {
+function resolveWebSearchEndpoint(fromDeps: string | null): { url: string; apiKey?: string } | null {
   if (fromDeps) {return { url: fromDeps, apiKey: process.env.TAVILY_API_KEY };}
   const explicit = process.env.NEXTCLAW_WEB_SEARCH_URL;
   if (explicit) {
@@ -227,15 +231,26 @@ function resolveWebSearchEndpoint(fromDeps: string | null): { url: string; apiKe
   if (directKey) {
     return { url: "https://api.tavily.com/search", apiKey: directKey };
   }
-  // Last-resort placeholder. Real deployments should set credbroker or
-  // TAVILY_API_KEY; this URL is just so the call doesn't crash silently.
-  return { url: "http://100.79.97.110:8800/v1/proxy/tavily/search" };
+  return null;
 }
 
 async function execWebSearch(
   args: Record<string, unknown>,
   webSearchUrl: string | null,
 ): Promise<ToolResult> {
+  const endpoint = resolveWebSearchEndpoint(webSearchUrl);
+  if (!endpoint) {
+    return {
+      name: "web_search",
+      content: JSON.stringify({
+        error:
+          "web_search is not configured on this deployment. " +
+          "Operator: set credbroker.baseUrl in config OR export TAVILY_API_KEY. " +
+          "If the user's question needs current/live information, tell them you " +
+          "don't have web access here and suggest they check the source directly.",
+      }),
+    };
+  }
   const query = typeof args.query === "string" ? args.query.trim() : "";
   if (query.length < 2) {
     return {
@@ -245,7 +260,7 @@ async function execWebSearch(
   }
   const maxRaw = typeof args.max === "number" ? args.max : WEB_SEARCH_DEFAULT;
   const max = Math.min(WEB_SEARCH_MAX, Math.max(1, Math.floor(maxRaw)));
-  const { url, apiKey } = resolveWebSearchEndpoint(webSearchUrl);
+  const { url, apiKey } = endpoint;
   const body: Record<string, unknown> = { query, max_results: max };
   if (apiKey) {body.api_key = apiKey;}
   const ctrl = new AbortController();

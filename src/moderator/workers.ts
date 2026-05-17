@@ -114,6 +114,12 @@ export async function upsertWorkerRole(
   roleKey: string,
   spec: NonNullable<import("./types.js").AnswerTask["newRoleSpec"]>,
   createdByScope: string,
+  /** Model identifier to store in the row's `model` column. Advisory
+   *  only (runtime uses the injected WorkerLlmClient). When omitted
+   *  we fall back to DEFAULT_ROLE.model — but real deployments should
+   *  pass `${cfg.moderator.model.format}:${cfg.moderator.model.model}`
+   *  so the row reflects what's actually wired. */
+  modelIdentifier?: string,
 ): Promise<boolean> {
   // Soft cap — refuse silently if the agent has too many roles already.
   const cnt = await pool.query<{ n: string }>(
@@ -149,7 +155,7 @@ export async function upsertWorkerRole(
       spec.systemPrompt,
       requestedTools,
       JSON.stringify(spec.memoryScope ?? {}),
-      DEFAULT_ROLE.model, // model preference inherits default; can be tuned per-row later
+      modelIdentifier ?? DEFAULT_ROLE.model,
       createdByScope,
     ],
   );
@@ -265,12 +271,17 @@ export async function dispatchWorker(
   // DEFAULT_ROLE, mirroring the pre-leverage behavior.
   if (task.newRoleSpec) {
     try {
+      // Pass the deployment's actual configured Moderator model so the
+      // stored row reflects what's wired (not a hardcoded gemini-flash).
+      const runtimeModel =
+        `${deps.cfg.moderator.model.format}:${deps.cfg.moderator.model.model}`;
       const created = await upsertWorkerRole(
         deps.pool,
         deps.agentId,
         task.roleKey,
         task.newRoleSpec,
         scopeKey,
+        runtimeModel,
       );
       if (created) {
         deps.logger.info(
@@ -547,8 +558,10 @@ const NON_ANSWER_PATTERNS: RegExp[] = [
 
 function looksLikeNonAnswer(text: string): boolean {
   const t = text.trim();
-  // Very short replies are likely non-answers ("不知道。" / "Unknown").
-  if (t.length < 12) {return true;}
+  if (t.length === 0) {return true;}
+  // No length floor — a short answer like "2" to "1+1=?" is legit. The
+  // pattern set below catches real non-answers (declines, "I don't know",
+  // "no information found"); brevity alone isn't a signal.
   return NON_ANSWER_PATTERNS.some((p) => p.test(t));
 }
 

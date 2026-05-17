@@ -582,9 +582,14 @@
       "moderator": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Phase C orchestrator-worker Moderator. When enabled, hooks Telegram message_received events for groups + DMs (DMs continue through the existing per-DM agent path; groups get routed via the Moderator). Off by default.",
+        "description": "Phase C orchestrator-worker Moderator. When enabled, claims Telegram group @-mentions via the `before_dispatch` hook and runs an orchestrator-worker decision loop. DMs are untouched (codex still handles them). Off by default.",
         "properties": {
           "enabled": { "type": "boolean", "default": false },
+          "agentId": {
+            "type": "string",
+            "default": "main",
+            "description": "Namespace separator on every row this service writes (moderator.state, moderator.decisions, cache.qa rows produced by workers, moderator.worker_roles). Change this if you run a second openclaw instance against the same Postgres."
+          },
           "debounceMs": {
             "type": "number",
             "minimum": 100,

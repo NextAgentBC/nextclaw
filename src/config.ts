@@ -155,10 +155,13 @@ export type MemoryPostgresConfig = {
 
 export type ModeratorConfig = {
   enabled?: boolean;
+  /** Namespace separator on every row this service writes. Default "main".
+   *  Set this if you run a second openclaw instance against the same DB. */
+  agentId?: string;
   /** LLM transport — mirrors reflection.model. Default: gpt-5.5 via OpenAI. */
   model?: {
     format: "openai" | "gemini";
-    baseUrl: string;
+    baseUrl?: string;
     model: string;
     apiKeyEnv?: string;
   };
@@ -321,6 +324,7 @@ export type ResolvedMemoryPostgresConfig = {
 
 export type ResolvedModeratorConfig = {
   enabled: boolean;
+  agentId: string;
   debounceMs: number;
   model: {
     format: "openai" | "gemini";
@@ -511,6 +515,9 @@ function resolveModeratorConfig(
   const credbrokerFallback = format === "gemini" ? credbroker.geminiUrl : null;
   return {
     enabled: bool(block.enabled, false),
+    agentId: isString((block as { agentId?: unknown }).agentId)
+      ? ((block as { agentId: string }).agentId)
+      : "main",
     debounceMs: Math.max(100, num(block.debounceMs, 1500)),
     model: {
       format,
