@@ -4,7 +4,25 @@ This is the **fresh-machine** guide. If you already have OpenClaw + an
 embedding endpoint running, jump to step ④.
 
 Tested on Ubuntu 24.04 + macOS 14. Should work on any host with Docker +
-Node 22+. Estimated time: **30 minutes** end to end including downloads.
+Node 22+. Estimated time: **30 minutes** for the memory-only path, **+15
+minutes** if you also want the Telegram Moderator + `web_search`.
+
+> 📦 **Before you start: see [SERVICES.md](SERVICES.md)** for the
+> complete list of external services nextclaw can use (Postgres, Jina,
+> Gemini, Tavily, Telegram, OpenAI, credbroker), with signup links and
+> per-service verification commands. This walkthrough assumes you've
+> decided which services you want.
+
+### Capability levels (pick one before starting)
+
+| Level | What works | External services needed | Estimated time |
+|---|---|---|---|
+| **A. Memory only** | Recall, ingest, dashboard, isolation | Postgres + Jina | 20 min |
+| **B. + Reflection** | Above + nightly memory consolidation | Postgres + Jina + Gemini | 25 min |
+| **C. + Telegram Moderator** | Above + group `@bot` answers | Postgres + Jina + Gemini + Telegram bot | 40 min |
+| **D. + Web search** | Above + worker `web_search` for current info | Postgres + Jina + Gemini + Telegram + Tavily | 45 min |
+
+This walkthrough builds **Level A first**, then has bolt-on sections for B/C/D you can run later.
 
 ---
 
@@ -440,6 +458,140 @@ Verification — the club agent's `agent_id='club'` chunks are filtered at the
 SQL level on every recall path. A `WHERE c.agent_id = $X` clause stops
 cross-agent reads even if the prompt is adversarial. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the full isolation model.
+
+---
+
+## Bolt-on: nightly reflection (Level B)
+
+The reflection daemon reads the last 24h of conversation chunks and writes a single distilled `kind='reflection'` summary chunk + a `kind='profile'` set that gets primed into T0 (the model's working memory) on every recall. Result: long-running context survives across days without re-feeding history into the prompt.
+
+**Prerequisite:** an LLM endpoint. Free recommendation: **Gemini 2.5 Flash** — see [SERVICES.md §3](SERVICES.md#3-gemini-google-ai-studio--free-llm-for-moderator--reflection).
+
+```bash
+# Get a Gemini key from https://aistudio.google.com/apikey
+export GEMINI_API_KEY=AIza...
+```
+
+Add to `openclaw.json` under `memory-postgres.config`:
+
+```jsonc
+"reflection": {
+  "enabled": true,
+  "intervalMs": 86400000,
+  "lookbackHours": 24,
+  "model": {
+    "format": "gemini",
+    "baseUrl": "https://generativelanguage.googleapis.com",
+    "model": "gemini-2.5-flash",
+    "apiKeyEnv": "GEMINI_API_KEY"
+  }
+}
+```
+
+Restart OpenClaw. Verify in logs:
+
+```
+memory-postgres: reflection daemon started — format=gemini model=gemini-2.5-flash intervalMs=86400000
+```
+
+The first reflection runs ~24h after startup. To force one early, manually call the dashboard endpoint (token required):
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8765/api/reflection/run-now" \
+  -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN"
+```
+
+---
+
+## Bolt-on: Telegram Moderator (Level C)
+
+The Moderator is an opinionated orchestrator-worker that **claims** Telegram group `@-mentions` away from codex (or whatever else would have answered) and runs a multi-step decision loop:
+
+1. Cache pre-check (L0/L1/L2) — repeats answered in <50ms with 0 LLM tokens
+2. Moderator decision — gpt-5.5 / gemini-flash picks `answer-direct` / `clarify` / `escalate` / etc.
+3. Worker dispatch — specialist role + memory_search + (optional) web_search
+4. Reply via Telegram Bot API — placeholder ⏳ first, edited with answer when ready
+5. Write answer back to cache.qa so next similar question hits the pre-check
+
+DMs are NOT claimed — codex handles them as before.
+
+**Prerequisites:**
+1. **Telegram bot token** — get from [@BotFather](https://t.me/BotFather), see [SERVICES.md §4](SERVICES.md#4-telegram-bot--required-for-moderator)
+2. **Your Telegram user ID** — get from [@userinfobot](https://t.me/userinfobot)
+3. **LLM endpoint** (Gemini recommended, same key as reflection works)
+
+```bash
+# Already have these from Level B; just adding the Telegram pieces:
+export GEMINI_API_KEY=AIza...
+TELEGRAM_BOT_TOKEN=1234567890:AAH...   # not exported — goes inline in config
+TELEGRAM_OWNER_ID=8064984663            # YOUR Telegram user id from @userinfobot
+```
+
+Add to `openclaw.json` (top level, alongside `plugins`):
+
+```jsonc
+"channels": {
+  "telegram": {
+    "enabled": true,
+    "botToken": "1234567890:AAH...",
+    "polling": { "enabled": true }
+  }
+},
+"commands": {
+  "ownerAllowFrom": ["telegram:8064984663"]
+}
+```
+
+And under `memory-postgres.config`:
+
+```jsonc
+"moderator": {
+  "enabled": true,
+  "agentId": "main",
+  "debounceMs": 1500,
+  "model": {
+    "format": "gemini",
+    "baseUrl": "https://generativelanguage.googleapis.com",
+    "model": "gemini-2.5-flash",
+    "apiKeyEnv": "GEMINI_API_KEY"
+  }
+}
+```
+
+**Set the IPv6 workaround on Oracle Cloud / hosts with broken IPv6**: see [docs/CONFIG.md](CONFIG.md#telegram-on-ipv6-broken-hosts) — add `OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY=1` to the systemd drop-in.
+
+Restart OpenClaw. Add your bot to a Telegram group. Send `@my_tutor_bot hello`. Watch:
+
+```bash
+journalctl --user -u openclaw-gateway --since "1 min ago" | grep -E "moderator|before_dispatch"
+```
+
+You should see `[moderator/hook] before_dispatch CLAIMED` followed by `moderator: scope=tg:chat:... action=answer-direct`. Bot replies with placeholder ⏳ then the actual answer.
+
+**Common gotcha:** Telegram bots in groups only see messages that **@-mention them** or **reply to their messages** (default privacy mode). That's exactly what the Moderator wants. Do NOT use `/setprivacy` → Disable unless you want the Moderator processing every group message.
+
+---
+
+## Bolt-on: web_search worker tool (Level D)
+
+Without this, the worker can answer from memory + LLM training but says it can't browse for current info (news, latest version numbers, anything time-sensitive). Adding Tavily unlocks live web search inside the worker's tool-call loop.
+
+**Get a Tavily key:** [SERVICES.md §5](SERVICES.md#5-tavily--web-search-for-the-moderators-web_search-tool) — free 1,000 searches/month.
+
+```bash
+export TAVILY_API_KEY=tvly-...
+echo 'export TAVILY_API_KEY=tvly-...' >> ~/.bashrc
+```
+
+**That's literally it — no config change needed.** The worker tool registry picks up `TAVILY_API_KEY` automatically when the env var is set. Restart OpenClaw and the next time someone asks the bot about a recent event, the worker will invoke `web_search({"query":"..."}` and cite URLs in the answer.
+
+**Verify after restart:** ask the bot something current like "@my_tutor_bot 今天有什么 AI 新闻". The log should show:
+
+```
+worker[tN]: model invoked 1 tool(s): web_search
+```
+
+If you see this but no answer: Tavily call failed (check `journalctl ... | grep web_search`). If you don't see this line at all: the worker decided memory was enough — that's the model's call.
 
 ---
 
