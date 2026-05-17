@@ -56,6 +56,11 @@ export type ModeratorServiceConfig = {
   /** Resolved nextclaw config (mostly for agentId, pool). */
   cfg: ResolvedMemoryPostgresConfig;
   pool: Pool;
+  /** Owning agent id — the namespace separator on every row this service
+   *  writes (state, decisions, cache.qa rows produced by workers,
+   *  worker_roles). Default "main". Set to something else if you run a
+   *  second openclaw instance against the same Postgres. */
+  agentId?: string;
   /** Logger; the api.logger from openclaw works. */
   logger: { info: (m: string) => void; warn: (m: string) => void };
   /** Per-user debounce window in ms. Default 1500. */
@@ -99,6 +104,7 @@ export type PluginMessageContext = {
 export function startModeratorService(config: ModeratorServiceConfig): ModeratorServiceHandle {
   const tg = new TelegramBotApi({ botToken: config.telegramBotToken });
   const debounceMs = config.debounceMs ?? 1500;
+  const agentId = config.agentId ?? "main";
 
   // Per-scope serial queue: one in-flight cycle per scopeKey at a time.
   const scopeMutex = new Map<string, Promise<void>>();
@@ -159,10 +165,10 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
   ): Promise<void> {
     try {
       // 1. Load state (or init).
-      const state = await loadModeratorState(config.pool, config.cfg ? "main" : "main", scopeKey);
+      const state = await loadModeratorState(config.pool, agentId, scopeKey);
 
       // 2. Skip if scope is paused (operator did /takeover).
-      const status = await readScopeStatus(config.pool, scopeKey);
+      const status = await readScopeStatus(config.pool, agentId, scopeKey);
       if (status === "paused" || status === "archived") {
         config.logger.info(`moderator: scope ${scopeKey} is ${status}, skipping`);
         return;
@@ -173,7 +179,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
       //      The bulk of repeat-question savings lives here (~50ms vs 6s,
       //      0 vs 1500 Gemini tokens).
       const precheck = await tryCachePrecheck(
-        { pool: config.pool, embedding: config.embedding, agentId: "main" },
+        { pool: config.pool, embedding: config.embedding, agentId: agentId },
         {
           scopeKey,
           questionText: trigger.text,
@@ -195,7 +201,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
           config.logger.warn(`moderator: cache-hit send failed: ${sendRes.error}`);
         }
         // Persist the inbound + a synthetic "cache-hit" decision row for audit.
-        await saveModeratorState(config.pool, "main", scopeKey, {
+        await saveModeratorState(config.pool, agentId, scopeKey, {
           ...state,
           recentMessages: [...state.recentMessages, trigger].slice(-50),
           messagesSinceLastReview: state.messagesSinceLastReview + 1,
@@ -205,7 +211,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
           lastMessageAt: new Date(),
         });
         await logDecision(config.pool, {
-          agentId: "main",
+          agentId: agentId,
           scopeKey,
           triggerKind: "message",
           triggerUserId: senderUserId,
@@ -249,7 +255,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
         ingestUrl: config.ingestUrl,
         ingestToken: config.ingestToken,
         triggerSenderUserId: senderUserId,
-        agentId: "main",
+        agentId: agentId,
         logger: config.logger,
       });
 
@@ -271,7 +277,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
           workerLlm: config.workerLlm,
           embedding: config.embedding,
           cfg: config.cfg,
-          agentId: "main",
+          agentId: agentId,
           logger: config.logger,
         };
         const viewer = { userId: senderUserId, chatId };
@@ -325,7 +331,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
       }
 
       // 6. Save state. If escalation asked to pause the scope, flip status.
-      await saveModeratorState(config.pool, "main", scopeKey, updatedState, {
+      await saveModeratorState(config.pool, agentId, scopeKey, updatedState, {
         bumpMessageCount: 1,
         bumpDecisionCount: 1,
         lastMessageAt: new Date(),
@@ -336,7 +342,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
 
       // 7. Decision audit log.
       await logDecision(config.pool, {
-        agentId: "main",
+        agentId: agentId,
         scopeKey,
         triggerKind: "message",
         triggerUserId: senderUserId,
@@ -510,10 +516,10 @@ function ensureUserFacingReply(decision: import("./types.js").ModeratorDecision)
   decision.telegramActions = [...acts, { kind: "send_message", text }];
 }
 
-async function readScopeStatus(pool: Pool, scopeKey: string): Promise<string | null> {
+async function readScopeStatus(pool: Pool, agentId: string, scopeKey: string): Promise<string | null> {
   const r = await pool.query<{ status: string }>(
-    `SELECT status FROM moderator.state WHERE agent_id = 'main' AND scope_key = $1`,
-    [scopeKey],
+    `SELECT status FROM moderator.state WHERE agent_id = $1 AND scope_key = $2`,
+    [agentId, scopeKey],
   );
   return r.rows[0]?.status ?? null;
 }

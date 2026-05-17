@@ -43,6 +43,8 @@
 - **Multi-key indexing** ("Xinhua dictionary"): every chunk reachable from many orthogonal angles — semantic / fulltext / trigram / concept tags / entity refs / time buckets / anchors / categories
 - **Deterministic-first ingest**: no LLM in the hot path; LLM exists only as a residual stage when deterministic extraction yields nothing
 - **Hard per-agent memory namespace isolation**: run a private agent and a public Discord agent on the same database — they physically can't see each other's memory (SQL-layer enforcement, not application-layer)
+- **Semantic Q&A cache** (`cache.qa`): repeat questions hit at sub-millisecond (L0 LRU) → ~5ms (L1 exact hash) → ~50ms (L2 HNSW). Skips the LLM entirely on repeat questions.
+- **Telegram-group Moderator** (optional, off by default): orchestrator-worker pattern à la Anthropic's "Building Effective Agents". Routes group `@-mentions` to specialist workers with tools (`memory_search`, `web_search` via Tavily), persists role designs so the registry compounds over time.
 - **Real-time dashboard** (bilingual CN/EN) with category breakdown, redaction for health/medical, bot-turn telemetry, side-by-side model comparison
 - **Self-tuning loop** (daily / weekly / monthly proposals)
 - **Universal HTTP ingest gateway** — any cron / skill / external script can write memory through the same Stage 0–6 pipeline
@@ -135,9 +137,41 @@ In a typical workload, ingest spends **0 LLM tokens** end-to-end. Recall LLM tok
 - Their `text_excerpt` is redacted in the dashboard's `/api/recent` response
 - Per-agent isolation means a public-facing agent **cannot** retrieve them even via adversarial prompting
 
+## Scope & limits
+
+Be explicit about what this plugin is and isn't, so you can decide if it fits before installing:
+
+### The **memory pipeline** (recall, ingest, dashboard, cache, isolation) is channel-agnostic
+Works with any openclaw agent — DM, Discord, Slack, WhatsApp, etc. Ingest accepts text from any source via the HTTP gateway. **No coupling to a specific channel or bot account.**
+
+### The **Moderator** (Phase C / D, opt-in) is **Telegram-group-only** today
+When `moderator.enabled=true`, the plugin registers a `before_dispatch` hook that claims **group @-mentions on the `telegram` channel** — codex (or whatever other plugin would have replied) is suppressed for those messages; the Moderator replies out-of-band via the Telegram Bot API.
+
+- **DMs are untouched** — codex handles them as before
+- **Group messages without an @-mention are untouched** — codex doesn't reply to those anyway
+- **Slack / Discord / WhatsApp `@-mentions` are NOT claimed** — only `channelId === "telegram"` matches today
+
+If you want the Moderator on another channel, the suppression rule (`index.ts` → `before_dispatch` hook) and the Telegram-Bot-API reply path (`src/moderator/telegram-api.ts`) both need adaptation. Issue/PR welcome.
+
+### Single-tenant by default; explicitly multi-tenant
+Every row this plugin writes carries an `agent_id` column. The Moderator uses `cfg.moderator.agentId` (default `"main"`). To run two openclaw instances against the same Postgres without collision, give each install a distinct `agentId`:
+
+```jsonc
+"moderator": { "enabled": true, "agentId": "tutor-bot" }
+```
+
+`worker_roles`, `moderator.state`, `moderator.decisions`, and `cache.qa` rows are all namespaced — the agents can't see each other's state.
+
+### `web_search` tool requires a Tavily endpoint
+Either `credbroker.baseUrl` (Tailscale credential broker that proxies Tavily — see [docs/CONFIG.md](docs/CONFIG.md)) or `TAVILY_API_KEY` in env. **Without one, `web_search` returns an honest error** to the LLM (which then explains the limitation to the user). No silent failures.
+
+### LLM transport
+- Moderator decision LLM: **OpenAI-compatible** or **Gemini `:generateContent`** (with tool calls). OpenAI tool-call format is single-shot only today; multi-turn tool calls require Gemini.
+- Embedding: **Jina, OpenAI-compat, or Ollama**. Default is Jina free tier.
+
 ## Status
 
-`v0.1.0` — initial public release. Core architecture is settled; APIs may evolve in `0.x` based on feedback. Live tests pass against the reference setup. See [CHANGELOG.md](CHANGELOG.md).
+`v0.2.x` — memory pipeline + dashboard stable; Moderator + worker-tools layer (Phase C/D) live-tested but newer. Live tests pass against the reference setup. Concurrency simulation covers 8 scenarios (cache stampede, cross-scope parallelism, viewer isolation, mixed load, worker round-trip, role auto-register, tool calls, web_search). See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
