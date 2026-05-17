@@ -30,6 +30,7 @@ import type { ResolvedMemoryPostgresConfig } from "../config.js";
 import { storeCachedAnswer } from "../cache/qa.js";
 import { chatSingle, exportToolResultsAsHistory, type WorkerLlmClient } from "./worker-llm.js";
 import { executeToolsBatch, resolveTools, type ToolCall } from "./worker-tools.js";
+import { emitRoleAsSkill } from "./skill-emit.js";
 
 export type WorkerDeps = {
   pool: Pool;
@@ -43,6 +44,10 @@ export type WorkerDeps = {
    *  be null/undefined; the web_search tool then tries env / credbroker
    *  / honest error. */
   tavilyApiKey?: string | null;
+  /** When set, every Moderator-coined role that successfully upserts
+   *  ALSO gets a SKILL.md emitted to this directory so codex (in DMs)
+   *  can use the same specialist via the regular skills mechanism. */
+  publishSkillsDir?: string | null;
   logger: { info: (m: string) => void; warn: (m: string) => void };
 };
 
@@ -292,6 +297,22 @@ export async function dispatchWorker(
         deps.logger.info(
           `worker[${task.taskId}]: registered new role '${task.roleKey}' (${task.newRoleSpec.systemPrompt.length} chars)`,
         );
+        // Synergy: if skill publishing is enabled, also drop a SKILL.md
+        // into the configured directory so codex (DM users) can use the
+        // same specialist. Best-effort — never blocks the worker.
+        if (deps.publishSkillsDir && task.newRoleSpec.systemPrompt) {
+          void emitRoleAsSkill({
+            dir: deps.publishSkillsDir,
+            roleKey: task.roleKey,
+            displayName: task.newRoleSpec.displayName ?? task.roleKey,
+            systemPrompt: task.newRoleSpec.systemPrompt,
+            // memoryScope.topic gives the model a hint at "what topics this specialist owns"
+            description: task.newRoleSpec.memoryScope?.topic
+              ? `Specialist for topic '${task.newRoleSpec.memoryScope.topic}'. ${task.newRoleSpec.displayName ?? ""}`
+              : undefined,
+            logger: deps.logger,
+          }).catch(() => undefined);
+        }
       }
     } catch (e) {
       deps.logger.warn(`worker[${task.taskId}]: role upsert failed: ${(e as Error).message}`);

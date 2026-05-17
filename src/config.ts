@@ -167,6 +167,16 @@ export type ModeratorConfig = {
   };
   /** Per (scope, user) burst-collapse window. Default 1500ms. */
   debounceMs?: number;
+  /** When enabled, every Moderator-coined worker role also gets a
+   *  SKILL.md emitted so codex (in DMs) can invoke the same specialist
+   *  via the regular OpenClaw skills mechanism. Off by default. */
+  publishAsSkills?: {
+    enabled?: boolean;
+    /** Directory the per-role SKILL.md folders are written into. Must
+     *  be a directory OpenClaw scans for skills (typically a workspace
+     *  skills subdir). Default: `~/.openclaw/skills/nextclaw-roles`. */
+    dir?: string;
+  };
 };
 
 export type ReflectionConfig = {
@@ -332,6 +342,8 @@ export type ResolvedModeratorConfig = {
     model: string;
     apiKeyEnv?: string;
   };
+  /** Resolved skill-emit directory, or `null` when disabled. */
+  publishSkillsDir: string | null;
 };
 
 export type ResolvedReflectionConfig = {
@@ -513,6 +525,22 @@ function resolveModeratorConfig(
   const format = modelBlock.format === "gemini" ? "gemini" : "openai";
   // Credbroker proxies Gemini only — for openai we never derive.
   const credbrokerFallback = format === "gemini" ? credbroker.geminiUrl : null;
+  // Skill emit directory: enabled gates the whole feature; dir defaults to
+  // ~/.openclaw/skills/nextclaw-roles via defaultSkillEmitDir(). We resolve
+  // to `null` when disabled so the worker dispatch path can skip emit
+  // cheaply, OR to a fully-resolved absolute path string.
+  const publishBlock = (block as { publishAsSkills?: { enabled?: unknown; dir?: unknown } }).publishAsSkills ?? {};
+  let publishSkillsDir: string | null = null;
+  if (publishBlock.enabled === true) {
+    if (isString(publishBlock.dir) && publishBlock.dir.length > 0) {
+      publishSkillsDir = publishBlock.dir;
+    } else {
+      // Substitute the default lazily to avoid pulling the moderator module
+      // into the config-resolution import graph (circular concern).
+      const home = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+      publishSkillsDir = `${home}/.openclaw/skills/nextclaw-roles`;
+    }
+  }
   return {
     enabled: bool(block.enabled, false),
     agentId: isString((block as { agentId?: unknown }).agentId)
@@ -526,6 +554,7 @@ function resolveModeratorConfig(
         : format === "gemini" ? "gemini-2.5-flash" : "gpt-5.5",
       apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
     },
+    publishSkillsDir,
   };
 }
 
