@@ -361,6 +361,69 @@ async function scenarioH_webSearch() {
   await pool.query("DELETE FROM moderator.worker_roles WHERE agent_id=$1 AND role_key=$2", [AGENT, roleKey]);
 }
 
+async function scenarioI_skillEmit() {
+  console.log("\n=== I. Skill emit — Moderator-coined role also lands as a SKILL.md ===");
+  const { mkdtempSync, readFileSync, existsSync, rmSync } = await import("node:fs");
+  const tmpRoot = mkdtempSync("/tmp/nextclaw-sim-skills-");
+  console.log(`  tmp skills dir: ${tmpRoot}`);
+
+  const workerLlm = buildWorkerLlmFromConfig({
+    format: "gemini",
+    baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
+    model: "gemini-2.5-flash",
+  });
+  const cfg = {
+    pluginId: "memory-postgres",
+    storage: { schema: "public", chunksTable: "chunks", chunkIndexesTable: "chunk_indexes" },
+    embedding: { model: "qwen3-embedding:0.6b" },
+    moderator: { model: { format: "gemini", model: "gemini-2.5-flash" } },
+  };
+  const logger = { info: (m) => console.log("    log:", m), warn: () => {} };
+  const wkDeps = { pool, workerLlm, embedding, cfg, agentId: AGENT, logger, publishSkillsDir: tmpRoot };
+
+  const uid = randomUUID().slice(0, 6);
+  const roleKey = `sim_skillemit_${uid}`;
+  const task = {
+    taskId: `t_skillemit_${uid}`,
+    roleKey,
+    taskPrompt: "用一句话回答：1+1=?",
+    canParallel: true,
+    newRoleSpec: {
+      systemPrompt: `你是一个 [${uid}] 测试 specialist：用 8 个字以内回答任何数学题。`,
+      displayName: `Sim Skill Specialist ${uid}`,
+      memoryScope: { topic: "sim.skill-emit" },
+      tools: [],
+    },
+  };
+
+  const result = await dispatchWorker(
+    wkDeps,
+    task,
+    { userId: "u-sim", chatId: "-1003789981008" },
+    task.taskPrompt,
+    SCOPE,
+  );
+  console.log(`  worker ok: ${result.ok}`);
+
+  const skillPath = `${tmpRoot}/${roleKey}/SKILL.md`;
+  const skillFileExists = existsSync(skillPath);
+  console.log(`  SKILL.md exists at ${skillPath}: ${skillFileExists ? "✓" : "✗"}`);
+  if (skillFileExists) {
+    const content = readFileSync(skillPath, "utf8");
+    const hasFrontmatter = content.startsWith("---\n");
+    const hasRoleKey = content.includes(`name: ${roleKey}`);
+    const hasSystemPrompt = content.includes("测试 specialist");
+    console.log(`  frontmatter present: ${hasFrontmatter ? "✓" : "✗"}`);
+    console.log(`  name field matches: ${hasRoleKey ? "✓" : "✗"}`);
+    console.log(`  systemPrompt body present: ${hasSystemPrompt ? "✓" : "✗"}`);
+    console.log(`  first 200 chars:\n    ${content.slice(0, 200).replace(/\n/g, "\n    ")}`);
+  }
+
+  // Cleanup
+  await pool.query("DELETE FROM moderator.worker_roles WHERE agent_id=$1 AND role_key=$2", [AGENT, roleKey]);
+  rmSync(tmpRoot, { recursive: true, force: true });
+}
+
 async function main() {
   console.log("Concurrency simulation — Moderator cache + worker pipeline");
   console.log("==========================================================");
@@ -373,6 +436,7 @@ async function main() {
     await scenarioF_roleAutoRegister();
     await scenarioG_workerTools();
     await scenarioH_webSearch();
+    await scenarioI_skillEmit();
   } finally {
     await pool.end();
   }

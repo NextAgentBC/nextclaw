@@ -596,6 +596,18 @@
             "default": 1500,
             "description": "Per (scope,user) burst window — multiple messages within this window coalesce into one decision."
           },
+          "publishAsSkills": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "When enabled, every Moderator-coined worker role also gets a SKILL.md emitted to a directory OpenClaw scans for skills. Lets codex (in DMs) use the same specialist the Moderator designed for a group. Off by default — only meaningful when you want group↔DM specialist sharing.",
+            "properties": {
+              "enabled": { "type": "boolean", "default": false },
+              "dir": {
+                "type": "string",
+                "description": "Absolute path of the directory holding per-role subfolders. Default: ~/.openclaw/skills/nextclaw-roles (a workspace skills location OpenClaw scans by default)."
+              }
+            }
+          },
           "model": {
             "type": "object",
             "additionalProperties": false,

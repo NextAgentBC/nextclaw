@@ -285,6 +285,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
           cfg: config.cfg,
           agentId: agentId,
           tavilyApiKey: config.tavilyApiKey ?? null,
+          publishSkillsDir: config.cfg.moderator.publishSkillsDir,
           logger: config.logger,
         };
         const viewer = { userId: senderUserId, chatId };
