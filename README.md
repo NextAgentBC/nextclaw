@@ -49,6 +49,12 @@
 - **Self-tuning loop** (daily / weekly / monthly proposals)
 - **Universal HTTP ingest gateway** — any cron / skill / external script can write memory through the same Stage 0–6 pipeline
 
+## Companion skills
+
+Standalone OpenClaw skills that compose well with nextclaw:
+
+- **[openclaw-skill-reminder](https://github.com/NextAgentBC/openclaw-skill-reminder)** — privacy-conscious time-based reminders. The cron config file only sees opaque `reminder:<short-id>` names; the actual detail (names, addresses, appointments) lives in a mode-600 file. Used by `/dashboard` users to schedule follow-ups without leaking PII into `jobs.json`.
+
 ## Quick start (Level A — memory only, ~20 min)
 
 For the Telegram Moderator, web_search, and reflection upgrades, see the [INSTALL.md](docs/INSTALL.md) bolt-ons. **Read [SERVICES.md](docs/SERVICES.md) first** to know which external services each capability needs.
