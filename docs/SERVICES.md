@@ -273,14 +273,48 @@ After OpenClaw restarts with this config, go to your group and send `@my_tutor_b
 
 **Why:** the worker `web_search` tool wraps Tavily. Without it, the Moderator can answer from memory + LLM training but can't pull current info (news, latest version numbers, etc.). The worker will say so honestly.
 
-**Get a key:**
+### Already have OpenClaw's tavily plugin configured? You're done.
+
+If your `openclaw.json` already has:
+```jsonc
+"plugins": { "entries": { "tavily": { "enabled": true, "config": { "webSearch": { "apiKey": "tvly-..." } } } } }
+```
+(this is the standard place OpenClaw stores the codex-side tavily key — its setup wizard puts it here)
+
+**Then nextclaw's worker AUTOMATICALLY reuses the same key.** No `TAVILY_API_KEY` env, no extra config. At plugin startup we read `plugins.entries.tavily.config.webSearch.apiKey` and pass it to the worker's tool runtime. Both codex AND our Moderator worker hit Tavily with one configured credential.
+
+Resolution priority for the worker (first match wins):
+1. `cfg.credbroker.tavilyUrl` (if you have a Tailscale credential broker)
+2. OpenClaw's `plugins.entries.tavily.config.webSearch.apiKey` ← **most users land here**
+3. `NEXTCLAW_WEB_SEARCH_URL` env
+4. `TAVILY_API_KEY` env
+5. Nothing configured → `web_search` returns an honest error to the LLM; the LLM tells the user it can't search.
+
+### Don't have a Tavily key yet?
 
 1. Open [https://app.tavily.com/](https://app.tavily.com/)
 2. Sign in with Google / GitHub / email
 3. **API Keys** in the sidebar → **Create new key** (free tier: 1,000 searches / month)
 4. Copy (looks like `tvly-...`)
 
-**Set the env var:**
+**Configure it (option A — recommended, also gives codex web search):**
+
+Add to `openclaw.json` so BOTH codex and the Moderator worker reuse one key:
+
+```jsonc
+"plugins": {
+  "entries": {
+    "tavily": {
+      "enabled": true,
+      "config": {
+        "webSearch": { "apiKey": "tvly-..." }
+      }
+    }
+  }
+}
+```
+
+**Configure it (option B — Moderator-only, no codex web search):**
 
 ```bash
 export TAVILY_API_KEY=tvly-...
@@ -292,13 +326,13 @@ echo 'export TAVILY_API_KEY=tvly-...' >> ~/.bashrc
 ```bash
 curl -sS https://api.tavily.com/search \
   -H "Content-Type: application/json" \
-  -d "{\"api_key\":\"$TAVILY_API_KEY\",\"query\":\"openclaw github\",\"max_results\":2}" | head -c 200
+  -d "{\"api_key\":\"tvly-...\",\"query\":\"openclaw github\",\"max_results\":2}" | head -c 200
 # Returns JSON with results[]
 ```
 
-**Config:** *no config needed* — when `TAVILY_API_KEY` is in env, the worker's web_search tool auto-uses it. If both `credbroker.baseUrl` and `TAVILY_API_KEY` are set, credbroker wins.
+### Why two paths exist
 
-**If you skip this:** `web_search` returns `{"error":"web_search is not configured on this deployment..."}` to the LLM; the LLM tells the user it can't search the web; everything else still works.
+OpenClaw's tavily plugin registers a search tool for the **codex agent loop** — codex picks it up via `WebSearchProviderPlugin.createTool()`. Our Moderator worker is a **separate LLM call** outside codex's loop (it's the orchestrator dispatching specialists, not codex itself). So technically we run our own Tavily request. We just reuse codex's configured key so the operator doesn't pay attention twice.
 
 ---
 

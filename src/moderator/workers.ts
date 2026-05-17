@@ -38,6 +38,11 @@ export type WorkerDeps = {
   embedding: EmbeddingClient;
   cfg: ResolvedMemoryPostgresConfig;
   agentId: string;
+  /** Tavily API key — typically pulled from OpenClaw's tavily plugin
+   *  config at startup so the same key codex uses is reused here. May
+   *  be null/undefined; the web_search tool then tries env / credbroker
+   *  / honest error. */
+  tavilyApiKey?: string | null;
   logger: { info: (m: string) => void; warn: (m: string) => void };
 };
 
@@ -416,9 +421,11 @@ export async function dispatchWorker(
       cfg: deps.cfg,
       agentId: deps.agentId,
       viewer,
-      // Pulled from cfg.credbroker.tavilyUrl when set; falls back to env
-      // / hardcoded default in worker-tools.resolveWebSearchEndpoint.
+      // Resolution priority (in worker-tools.resolveWebSearchEndpoint):
+      //   webSearchUrl from credbroker > tavilyApiKey from openclaw's
+      //   tavily plugin > NEXTCLAW_WEB_SEARCH_URL env > TAVILY_API_KEY env > null.
       webSearchUrl: deps.cfg.credbroker?.tavilyUrl ?? null,
+      tavilyApiKey: deps.tavilyApiKey ?? null,
     },
     turn1.toolCalls,
   );

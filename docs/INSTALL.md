@@ -576,14 +576,9 @@ You should see `[moderator/hook] before_dispatch CLAIMED` followed by `moderator
 
 Without this, the worker can answer from memory + LLM training but says it can't browse for current info (news, latest version numbers, anything time-sensitive). Adding Tavily unlocks live web search inside the worker's tool-call loop.
 
-**Get a Tavily key:** [SERVICES.md §5](SERVICES.md#5-tavily--web-search-for-the-moderators-web_search-tool) — free 1,000 searches/month.
+**Already configured OpenClaw's tavily plugin** (you can tell because `openclaw doctor` mentions tavily, or you see `tavily web search provider selected` in startup logs)? **You're done.** nextclaw's Moderator worker auto-reuses the same Tavily key from `plugins.entries.tavily.config.webSearch.apiKey`. No env var, no extra config.
 
-```bash
-export TAVILY_API_KEY=tvly-...
-echo 'export TAVILY_API_KEY=tvly-...' >> ~/.bashrc
-```
-
-**That's literally it — no config change needed.** The worker tool registry picks up `TAVILY_API_KEY` automatically when the env var is set. Restart OpenClaw and the next time someone asks the bot about a recent event, the worker will invoke `web_search({"query":"..."}` and cite URLs in the answer.
+**Getting Tavily for the first time?** See [SERVICES.md §5](SERVICES.md#5-tavily--web-search-for-the-moderators-web_search-tool) — free 1,000 searches/month. Recommended path: put the key in `plugins.entries.tavily.config.webSearch.apiKey` so BOTH codex and the Moderator worker reuse one credential.
 
 **Verify after restart:** ask the bot something current like "@my_tutor_bot 今天有什么 AI 新闻". The log should show:
 
