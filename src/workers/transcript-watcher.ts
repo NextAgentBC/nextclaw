@@ -339,7 +339,16 @@ export async function pollTranscriptWatcher(
 
 export type TranscriptWatcherHandle = {
   watcherId: string;
+  agentId: string;
   stop: () => void;
+  /**
+   * Trigger an immediate poll instead of waiting for the next interval
+   * tick. Used by `session_end` / `after_compaction` hooks to ingest the
+   * just-finalised JSONL with sub-second latency instead of ~10s. Safe to
+   * call concurrently with the scheduled tick (poll has its own offset
+   * cursor; double-firing is a no-op for already-seen lines).
+   */
+  flushNow: () => Promise<void>;
 };
 
 export function startTranscriptWatcherDaemon(
@@ -374,10 +383,15 @@ export function startTranscriptWatcherDaemon(
 
   return {
     watcherId: deps.watcher.id,
+    agentId: deps.watcher.agentId,
     stop() {
       stopped = true;
       if (timer) {clearInterval(timer);}
       timer = null;
+    },
+    async flushNow() {
+      if (stopped) {return;}
+      await tick();
     },
   };
 }
