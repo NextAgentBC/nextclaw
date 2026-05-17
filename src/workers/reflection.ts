@@ -283,21 +283,68 @@ async function writeChunk(
   }
 }
 
-/* ----------------------- daemon (interval scheduling) ---------------------- */
+/* ----------------------- daemon (interval + event-driven) ----------------- */
 
-export type ReflectionDaemonHandle = { stop: () => void };
+export type ReflectionDaemonHandle = {
+  stop: () => void;
+  /**
+   * Event-driven trigger — call when `session_end` fires (or any other
+   * "user finished a chunk of work" signal). Throttled per-agent so we
+   * don't re-reflect the same agent twice within `minGapMs`; the periodic
+   * fallback timer covers agents that never cleanly session_end.
+   */
+  triggerForAgent: (agentId: string, reason: string) => Promise<void>;
+};
 
 export function startReflectionDaemon(args: {
   deps: ReflectionDeps;
   intervalMs: number;
+  /** Minimum gap between event-driven runs for the same agent. Default = intervalMs / 2. */
+  minGapMs?: number;
   logger: { info: (m: string) => void; warn: (m: string) => void };
 }): ReflectionDaemonHandle {
-  // Run once 5 min after start so the first day isn't empty.
   let stopped = false;
+  const lastRunByAgent = new Map<string, number>();
+  const minGapMs = args.minGapMs ?? Math.max(60 * 60_000, Math.floor(args.intervalMs / 2));
+
+  const runFor = async (agentId: string, reason: string): Promise<void> => {
+    if (stopped) {return;}
+    const now = Date.now();
+    const last = lastRunByAgent.get(agentId) ?? 0;
+    if (now - last < minGapMs) {
+      // Within throttle window — silent skip; common case after many
+      // session_end events fire for one agent in a row.
+      return;
+    }
+    lastRunByAgent.set(agentId, now);
+    try {
+      const outcome = await runReflectionForAgent(args.deps, agentId);
+      if (outcome.ok && ((outcome.reflectionChunkId !== undefined) || (outcome.profileChunksWritten ?? 0) > 0)) {
+        args.logger.info(
+          `memory-postgres: reflection (${reason}) agent=${agentId} ` +
+            `${outcome.chunksConsidered}c/${outcome.profileChunksWritten ?? 0}p`,
+        );
+      } else if (!outcome.ok) {
+        args.logger.warn(`memory-postgres: reflection (${reason}) agent=${agentId} err=${outcome.error}`);
+      }
+    } catch (err) {
+      args.logger.warn(`memory-postgres: reflection (${reason}) failed for ${agentId}: ${(err as Error).message}`);
+    }
+  };
+
+  // Periodic safety-net sweep: catches agents whose sessions never cleanly
+  // session_end (long-running DM threads, gateway crashes). Effectively a
+  // fallback for the event-driven path. Throttle map ensures the periodic
+  // tick is a no-op when session_end-driven runs are keeping up.
   const tick = async (): Promise<void> => {
     if (stopped) {return;}
     try {
       const outcomes = await runReflectionForAllAgents(args.deps);
+      for (const o of outcomes) {
+        if (o.ok && ((o.reflectionChunkId !== undefined) || (o.profileChunksWritten ?? 0) > 0)) {
+          lastRunByAgent.set(o.agentId, Date.now());
+        }
+      }
       const anyWork = outcomes.some(
         (o) => (o.reflectionChunkId !== undefined) || (o.profileChunksWritten ?? 0) > 0,
       );
@@ -309,12 +356,13 @@ export function startReflectionDaemon(args: {
               : `${o.agentId}:err(${o.error})`,
           )
           .join(" ");
-        args.logger.info(`memory-postgres: reflection tick — ${summary}`);
+        args.logger.info(`memory-postgres: reflection sweep — ${summary}`);
       }
     } catch (err) {
-      args.logger.warn(`memory-postgres: reflection tick failed: ${(err as Error).message}`);
+      args.logger.warn(`memory-postgres: reflection sweep failed: ${(err as Error).message}`);
     }
   };
+
   const timer = setInterval(() => void tick(), args.intervalMs);
   timer.unref?.();
   const initialTimer = setTimeout(() => void tick(), 5 * 60_000);
@@ -325,6 +373,7 @@ export function startReflectionDaemon(args: {
       clearInterval(timer);
       clearTimeout(initialTimer);
     },
+    triggerForAgent: runFor,
   };
 }
 

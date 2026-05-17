@@ -49,9 +49,15 @@ import { startModeratorService, type ModeratorServiceHandle } from "./src/modera
  * Module-level state side-steps that.
  */
 let MODULE_MODERATOR_HANDLE: ModeratorServiceHandle | null = null;
+/** Module-level handles for the event-driven hooks (after_compaction,
+ *  session_end). Same closure-isolation rationale as above. */
+let MODULE_TRANSCRIPT_WATCHERS: TranscriptWatcherHandle[] = [];
+let MODULE_REFLECTION_HANDLE: ReflectionDaemonHandle | null = null;
+let MODULE_INGEST_DEPS: import("./src/ingest/pipeline.js").IngestDeps | null = null;
 import { startTranscriptWatcherDaemon, type TranscriptWatcherHandle } from "./src/workers/transcript-watcher.js";
 import { startShadowComparator } from "./src/workers/shadow-comparator.js";
 import { evaluateGuards, runDailyAnalyzer } from "./src/workers/tuning.js";
+import { ingestCompactionSummary } from "./src/workers/compaction-ingest.js";
 
 const SERVICE_ID = "memory-postgres-dashboard";
 
@@ -167,6 +173,63 @@ export default definePluginEntry({
         );
       } catch (err) {
         api.logger.warn(`memory-postgres: moderator message_received hook threw: ${(err as Error).message}`);
+      }
+    });
+
+    /**
+     * after_compaction — codex just folded N messages into one LLM-driven
+     * summary in this session's JSONL. We promote that summary into
+     * `semantic.chunks` with kind='compaction', retention='pinned' so
+     * recall can find it later. Without this hook the summary lives only
+     * in the session file. Best-effort; failure logged.
+     */
+    api.on("after_compaction", async (event, hookCtx) => {
+      const ev = event as { messageCount?: number; tokenCount?: number; compactedCount?: number; sessionFile?: string };
+      if (!ev?.sessionFile || !ev.compactedCount) {return;}
+      const agentId = (hookCtx as { agentId?: string })?.agentId ?? "main";
+      const agentSessionId = (hookCtx as { sessionKey?: string; sessionId?: string })?.sessionId
+        ?? (hookCtx as { sessionKey?: string })?.sessionKey;
+      if (!MODULE_INGEST_DEPS) {return;}
+      void ingestCompactionSummary(
+        { ...MODULE_INGEST_DEPS, logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) } },
+        {
+          sessionFile: ev.sessionFile,
+          agentId,
+          agentSessionId,
+          messageCount: ev.messageCount ?? 0,
+          tokenCount: ev.tokenCount,
+          compactedCount: ev.compactedCount,
+        },
+      ).catch(() => undefined);
+    });
+
+    /**
+     * session_end — codex just finished a session. Two synergies:
+     *   1. Flush the transcript watcher NOW (don't wait ~10s for next
+     *      tick) so the session's tail lines land in memory immediately.
+     *   2. Trigger per-agent reflection (throttled per agent so a burst
+     *      of session-ends doesn't run 10 reflections in a row).
+     */
+    api.on("session_end", async (event, hookCtx) => {
+      const ev = event as { sessionId?: string; sessionKey?: string; reason?: string };
+      const ctxAgent = (hookCtx as { agentId?: string })?.agentId ?? "main";
+      // (1) immediate transcript flush for ALL watchers (cheap; each only
+      // re-reads new lines since its last offset cursor).
+      for (const w of MODULE_TRANSCRIPT_WATCHERS) {
+        w.flushNow().catch((err) =>
+          api.logger.warn(`session_end transcript flush failed (${w.watcherId}): ${(err as Error).message}`),
+        );
+      }
+      // (2) event-driven reflection. We only trigger for "natural" end
+      // reasons that imply a chunk of completed work — not for shutdown
+      // / restart (those are infra noise).
+      const productiveReasons = new Set(["new", "reset", "idle", "daily", "compaction"]);
+      const reason = typeof ev?.reason === "string" ? ev.reason : "unknown";
+      if (MODULE_REFLECTION_HANDLE && productiveReasons.has(reason)) {
+        void MODULE_REFLECTION_HANDLE.triggerForAgent(ctxAgent, `session_end:${reason}`)
+          .catch((err) =>
+            api.logger.warn(`session_end reflection trigger failed: ${(err as Error).message}`),
+          );
       }
     });
 
@@ -359,6 +422,13 @@ export default definePluginEntry({
               logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
             });
             transcriptWatcherHandles.push(handle);
+            // Publish to module-level state so the session_end /
+            // after_compaction hooks (registered at top-level register())
+            // can invoke flushNow without crossing closures.
+            MODULE_TRANSCRIPT_WATCHERS.push(handle);
+            // Capture ingest deps once so the after_compaction hook can
+            // build a CompactionContext without duplicating wiring.
+            MODULE_INGEST_DEPS = { cfg, pool, embedding };
             api.logger.info(
               `memory-postgres: transcript-watcher started — id=${watcher.id} `
                 + `dir=${watcher.dir} interval=${watcher.intervalMs}ms`,
@@ -386,6 +456,9 @@ export default definePluginEntry({
               intervalMs: cfg.reflection.intervalMs,
               logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
             });
+            // Publish module-level so session_end hook can trigger
+            // event-driven reflection (throttled inside the daemon).
+            MODULE_REFLECTION_HANDLE = reflectionHandle;
             api.logger.info(
               `memory-postgres: reflection daemon started — ` +
                 `format=${cfg.reflection.model.format} model=${cfg.reflection.model.model} ` +
@@ -544,11 +617,13 @@ export default definePluginEntry({
           try { reflectionHandle.stop(); } catch { /* ignore */ }
           reflectionHandle = null;
         }
+        MODULE_REFLECTION_HANDLE = null;
         if (moderatorHandle) {
           try { moderatorHandle.stop(); } catch { /* ignore */ }
           moderatorHandle = null;
         }
         MODULE_MODERATOR_HANDLE = null;
+        MODULE_INGEST_DEPS = null;
         if (moderatorEventUnsub) {
           try { moderatorEventUnsub(); } catch { /* ignore */ }
           moderatorEventUnsub = null;
@@ -563,6 +638,7 @@ export default definePluginEntry({
           try { h.stop(); } catch { /* ignore */ }
         }
         transcriptWatcherHandles = [];
+        MODULE_TRANSCRIPT_WATCHERS = [];
         for (const h of shadowHandles) {
           try { h.stop(); } catch { /* ignore */ }
         }
