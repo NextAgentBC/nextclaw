@@ -49,10 +49,12 @@
 - **Self-tuning loop** (daily / weekly / monthly proposals)
 - **Universal HTTP ingest gateway** — any cron / skill / external script can write memory through the same Stage 0–6 pipeline
 
-## Quick start
+## Quick start (Level A — memory only, ~20 min)
+
+For the Telegram Moderator, web_search, and reflection upgrades, see the [INSTALL.md](docs/INSTALL.md) bolt-ons. **Read [SERVICES.md](docs/SERVICES.md) first** to know which external services each capability needs.
 
 ```bash
-# 1. Install OpenClaw
+# 1. Install OpenClaw (the host runtime — required)
 git clone https://github.com/openclaw/openclaw.git ~/openclaw
 cd ~/openclaw && pnpm install && pnpm build
 
@@ -60,35 +62,61 @@ cd ~/openclaw && pnpm install && pnpm build
 git clone https://github.com/NextAgentBC/nextclaw.git ~/openclaw/extensions/memory-postgres
 cd ~/openclaw/extensions/memory-postgres/dev && docker compose up -d
 
-# 3. Get a free Jina embedding key (no card, 1M tokens)
-#    https://jina.ai/embeddings/  → copy the key
+# 3. Get a free Jina embedding key — 30 seconds, no card, 1M tokens/key.
+#    https://jina.ai/embeddings/  → click "Get API key for free" → copy
 export JINA_API_KEY=jina_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+echo 'export JINA_API_KEY=...' >> ~/.bashrc
 
 # 4. Build the plugin
 cd ~/openclaw && pnpm install && pnpm build
 
-# 5. Configure ~/.openclaw/openclaw.json — minimal:
-#      "plugins": {
-#        "slots": { "memory": "memory-postgres" },
-#        "entries": { "memory-postgres": { "enabled": true, "config": {
-#          "postgres": { "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw" }
-#        }}}
-#      }
-#    (embedding block is OPTIONAL — defaults to Jina free with JINA_API_KEY)
+# 5. Configure ~/.openclaw/openclaw.json — minimum to boot:
+cat > ~/.openclaw/openclaw.json <<'EOF'
+{
+  "plugins": {
+    "slots": { "memory": "memory-postgres" },
+    "entries": {
+      "memory-postgres": {
+        "enabled": true,
+        "config": {
+          "postgres": { "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw" },
+          "dashboard": { "enabled": true, "tokenEnv": "NEXTCLAW_DASH_TOKEN" }
+        }
+      }
+    }
+  }
+}
+EOF
+# (embedding block is OPTIONAL — defaults to Jina free with JINA_API_KEY)
 
 # 6. Start
 export NEXTCLAW_DASH_TOKEN=$(openssl rand -hex 24)
 pnpm openclaw gateway start
 
-# 7. Smoke test
+# 7. Smoke test — write then recall
 curl -sS -X POST http://127.0.0.1:8765/api/ingest \
   -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"text":"My favorite Postgres extension is pgvector.","source":"smoke","agentId":"main"}'
+
+curl -sS -X POST http://127.0.0.1:8765/api/recall \
+  -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"What is my favorite Postgres extension?","agentId":"main"}'
+# → returns the chunk with hitTier: "t2_hybrid"
 ```
 
-For the **0 → 1 walkthrough** with troubleshooting, persona files, and
-a Discord bot setup, see **[docs/INSTALL.md](docs/INSTALL.md)**.
+For the **full 0 → 1 walkthrough** with persona files, troubleshooting, Discord/Telegram bots, web_search, and multi-agent isolation, see **[docs/INSTALL.md](docs/INSTALL.md)**.
+
+### Installing nextclaw with help from an AI agent
+
+The docs are explicitly written to be read by both humans and LLM agents. If you'd like an agent to install nextclaw for you:
+
+1. Point the agent at **[docs/SERVICES.md](docs/SERVICES.md)** to enumerate which external services you'll need
+2. The agent walks through dependencies in order — Postgres → embedding → (optional) LLM → (optional) Telegram → (optional) Tavily — using each section's signup link, env-var name, and verification curl
+3. Final step: assemble the configured blocks into `openclaw.json` and run the smoke test in [INSTALL.md ⑦](docs/INSTALL.md#-start-then-verify-with-a-smoke-test)
+
+The "For AI agents" section at the bottom of SERVICES.md spells out the recommended dialogue flow.
 
 > **Want to self-host the embedder instead of Jina?** Run Ollama locally
 > and set `"embedding": { "format": "ollama" }` — the rest of the
@@ -104,7 +132,8 @@ a Discord bot setup, see **[docs/INSTALL.md](docs/INSTALL.md)**.
 
 | Doc | What it covers |
 |---|---|
-| **[docs/INSTALL.md](docs/INSTALL.md)** | Fresh-machine 0 → 1 walkthrough · Discord bot · multi-agent isolation · troubleshooting |
+| **[docs/SERVICES.md](docs/SERVICES.md)** | **Read first.** Every external service (Postgres, Jina, Gemini, Tavily, Telegram, OpenAI, credbroker) — signup links, env vars, config snippets, verification curls. Written for both AI agents and humans. |
+| **[docs/INSTALL.md](docs/INSTALL.md)** | Fresh-machine 0 → 1 walkthrough · Discord bot · Telegram Moderator · web_search · multi-agent isolation · troubleshooting. Four capability levels A → D you can ladder up through. |
 | **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | Storage layout · 4-tier recall · 8-route hybrid · Stage 0–6 ingest · isolation guarantees · scoring · self-tuning · workers |
 | **[docs/CONFIG.md](docs/CONFIG.md)** | Every config field, default, tuning advice |
 | **[docs/LIVE_TESTS.md](docs/LIVE_TESTS.md)** | How to run live tests against a real PG + embedding endpoint |
