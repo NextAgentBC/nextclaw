@@ -358,34 +358,68 @@ export async function routeGraphWalk(
   }
   if (seeds.length === 0) {return [];}
 
-  // Step 2: 1-hop neighbors via relations, then chunks indexed under those.
-  // GROUP BY neighbor + chunk and aggregate so a chunk that gets reached
-  // via multiple neighbors scores higher than one reached via just one.
-  const rows = await pool.query<RouteRow & { neighbors: number; avg_conf: number }>(
-    `WITH neighbors AS (
+  // Step 2: walk up to 2 hops via relations, score chunks by how easily
+  // they're reachable. Recursive CTE finds all neighbors at depth 1 and 2;
+  // we down-weight depth-2 contributions (a 1-hop relation is a stronger
+  // signal than a 2-hop chain). Closed relations (`ended_at < now`) older
+  // than 180d don't participate.
+  //
+  // This is the multi-hop extension HippoRAG / GraphRAG papers argue is
+  // the real graph win — answers questions like "what is the project Bob
+  // mentioned in his message that Alice replied to" where the chain
+  // crosses through two relation edges. 1-hop alone misses these.
+  const DEPTH2_DAMPENING = 0.5; // 2-hop neighbors count as half a 1-hop neighbor
+  const rows = await pool.query<RouteRow & { neighbors: number; min_depth: number; avg_conf: number }>(
+    `WITH RECURSIVE hops(neighbor_id, depth, confidence) AS (
+       -- depth 1: direct neighbors of any seed
        SELECT DISTINCT
-         CASE WHEN r.subject_id = ANY($1::uuid[]) THEN r.object_id
-              ELSE r.subject_id
-         END AS neighbor_id,
-         r.confidence
-       FROM structured.relations r
-       WHERE (r.subject_id = ANY($1::uuid[]) OR r.object_id = ANY($1::uuid[]))
-         AND (r.ended_at IS NULL OR r.ended_at > now() - interval '180 days')
+              CASE WHEN r.subject_id = ANY($1::uuid[]) THEN r.object_id
+                   ELSE r.subject_id END,
+              1,
+              r.confidence
+         FROM structured.relations r
+        WHERE (r.subject_id = ANY($1::uuid[]) OR r.object_id = ANY($1::uuid[]))
+          AND (r.ended_at IS NULL OR r.ended_at > now() - interval '180 days')
+       UNION ALL
+       -- depth 2: neighbors of depth-1 nodes; exclude seeds (no walking back)
+       SELECT DISTINCT
+              CASE WHEN r.subject_id = h.neighbor_id THEN r.object_id
+                   ELSE r.subject_id END,
+              2,
+              r.confidence * h.confidence  -- compound confidence along the path
+         FROM hops h
+         JOIN structured.relations r
+           ON (r.subject_id = h.neighbor_id OR r.object_id = h.neighbor_id)
+        WHERE h.depth = 1
+          AND (r.ended_at IS NULL OR r.ended_at > now() - interval '180 days')
+     ),
+     reachable AS (
+       -- Deduplicate to (neighbor_id, min_depth, best_conf) so the same
+       -- entity reached via both 1-hop and 2-hop gets credited at depth 1.
+       SELECT neighbor_id, min(depth) AS min_depth, max(confidence) AS confidence
+         FROM hops
+        WHERE neighbor_id IS NOT NULL
+          AND neighbor_id <> ALL($1::uuid[])
+        GROUP BY neighbor_id
      )
      SELECT c.id AS chunk_id, c.source, c.source_ref, c.text,
             count(DISTINCT n.neighbor_id)::int AS neighbors,
-            avg(n.confidence)::float AS avg_conf
-       FROM neighbors n
+            min(n.min_depth)::int AS min_depth,
+            avg(
+              CASE WHEN n.min_depth = 1 THEN n.confidence
+                   ELSE n.confidence * $4::float
+              END
+            )::float AS avg_conf
+       FROM reachable n
        JOIN semantic.chunk_indexes ci
          ON ci.kind = 'entity_ref' AND ci.value = n.neighbor_id::text
        JOIN semantic.chunks c ON c.id = ci.chunk_id
-      WHERE n.neighbor_id IS NOT NULL
-        AND c.retention_class != 'ephemeral'
+      WHERE c.retention_class != 'ephemeral'
         AND c.agent_id = $3
       GROUP BY c.id, c.source, c.source_ref, c.text
-      ORDER BY neighbors DESC, avg_conf DESC
+      ORDER BY min_depth ASC, neighbors DESC, avg_conf DESC
       LIMIT $2`,
-    [seeds, k, aid],
+    [seeds, k, aid, DEPTH2_DAMPENING],
   );
   if (rows.rows.length === 0) {return [];}
   const maxN = rows.rows.reduce((m, r) => Math.max(m, r.neighbors), 0);
@@ -394,9 +428,12 @@ export async function routeGraphWalk(
       build(
         r,
         r.neighbors,
-        // Composite: neighbor count (0..1) × avg confidence (0..1).
-        // A chunk reached via 3 distinct related entities each at 0.9
-        // confidence beats a chunk reached via 1 neighbor at 1.0.
+        // Composite: neighbor count (0..1) × avg confidence × depth bonus.
+        // A chunk reached via 3 distinct 1-hop neighbors at 0.9 conf beats
+        // one reached via 1 neighbor at 1.0; a 1-hop chunk beats a 2-hop
+        // chunk with same neighbor count (depth already baked into avg_conf
+        // via DEPTH2_DAMPENING, but we also use it as a stable sort key
+        // above to preserve tie-break behavior).
         maxN === 0 ? 0 : (r.neighbors / maxN) * Math.min(1, Math.max(0, r.avg_conf)),
       ),
     ),

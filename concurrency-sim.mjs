@@ -424,6 +424,84 @@ async function scenarioI_skillEmit() {
   rmSync(tmpRoot, { recursive: true, force: true });
 }
 
+async function scenarioJ_entityReflection() {
+  console.log("\n=== J. Entity-centric reflection — N mentions of one entity → entity_profile chunk ===");
+  const { randomUUID: uuid, createHash } = await import("node:crypto");
+  const { buildReflectionClient, runEntityReflectionForAgent } = await import(
+    "./dist/src/workers/reflection.js"
+  );
+
+  // Seed: ONE entity + 10 chunks mentioning it, all under a sim agent_id.
+  const simAgent = `sim-entity-${uuid().slice(0, 6)}`;
+  const entityId = uuid();
+  const entityName = `Project_Sim_${uuid().slice(0, 4)}`;
+  await pool.query(
+    `INSERT INTO structured.entities (id, type, canonical_name, confidence, first_seen_at, last_seen_at)
+     VALUES ($1, 'project', $2, 0.9, now() - interval '5 days', now() - interval '1 hour')`,
+    [entityId, entityName],
+  );
+  const chunkIds = [];
+  for (let i = 0; i < 10; i++) {
+    const cid = uuid();
+    const text = `Yao mentioned ${entityName} — context note ${i+1}: it ${i % 2 === 0 ? "ships next Tuesday" : "uses pgvector + HNSW"}.`;
+    const er = await embedding.embed({ inputs: [text] }).catch(() => null);
+    if (!er) {continue;}
+    const vec = "[" + er.embeddings[0].join(",") + "]";
+    const textHash = createHash("sha256").update(text, "utf8").digest();
+    await pool.query(
+      `INSERT INTO semantic.chunks (id, source, kind, text, text_hash, embedding, embedding_model, agent_id, retention_class, importance, created_at)
+       VALUES ($1, 'sim-seed', 'session', $2, $3, $4::vector, $5, $6, 'standard', 0.3, now() - ($7 || ' hours')::interval)`,
+      [cid, text, textHash, vec, er.model, simAgent, String(24 - i)],
+    );
+    await pool.query(
+      `INSERT INTO semantic.chunk_indexes (chunk_id, kind, value) VALUES ($1, 'entity_ref', $2)`,
+      [cid, entityId],
+    );
+    chunkIds.push(cid);
+  }
+  console.log(`  seeded entity=${entityName} (id=${entityId.slice(0, 8)}…) + ${chunkIds.length} chunks under agent=${simAgent}`);
+
+  // Trigger entity reflection.
+  const llm = buildReflectionClient({
+    enabled: true, intervalMs: 86400000, lookbackHours: 24, maxInputChars: 8000,
+    model: {
+      format: "gemini",
+      baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
+      model: "gemini-2.5-flash",
+    },
+  });
+  const cfg = {
+    enabled: true, intervalMs: 86400000, lookbackHours: 24 * 30, maxInputChars: 8000,
+    model: { format: "gemini", baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini", model: "gemini-2.5-flash" },
+  };
+  const outcomes = await runEntityReflectionForAgent(
+    { pool, embedding, llm, cfg },
+    simAgent,
+  );
+  console.log(`  outcomes: ${outcomes.length} candidate(s)`);
+  for (const o of outcomes) {
+    console.log(`    - ${o.entityName} ok=${o.ok} mentions=${o.mentionsConsidered} chunk=${o.profileChunkId?.slice(0,8) ?? "-"}`);
+  }
+
+  // Verify: entity_profile chunk exists AND is back-indexed under this entity.
+  const r = await pool.query(
+    `SELECT c.id::text, left(c.text, 120) AS text, c.kind, c.retention_class, c.importance
+       FROM semantic.chunks c
+       JOIN semantic.chunk_indexes ci ON ci.chunk_id = c.id AND ci.kind = 'entity_ref' AND ci.value = $2
+      WHERE c.agent_id = $1 AND c.kind = 'entity_profile'`,
+    [simAgent, entityId],
+  );
+  console.log(`  entity_profile rows under entity=${entityName}: ${r.rows.length} ${r.rows.length > 0 ? "✓" : "✗"}`);
+  if (r.rows.length > 0) {
+    console.log(`  retention=${r.rows[0].retention_class} importance=${r.rows[0].importance}`);
+    console.log(`  summary first 120: ${r.rows[0].text}`);
+  }
+
+  // Cleanup
+  await pool.query("DELETE FROM semantic.chunks WHERE agent_id = $1", [simAgent]);
+  await pool.query("DELETE FROM structured.entities WHERE id = $1", [entityId]);
+}
+
 async function main() {
   console.log("Concurrency simulation — Moderator cache + worker pipeline");
   console.log("==========================================================");
@@ -437,6 +515,7 @@ async function main() {
     await scenarioG_workerTools();
     await scenarioH_webSearch();
     await scenarioI_skillEmit();
+    await scenarioJ_entityReflection();
   } finally {
     await pool.end();
   }

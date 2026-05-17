@@ -283,6 +283,187 @@ async function writeChunk(
   }
 }
 
+/* ---------------------- entity-centric reflection ------------------------- */
+
+/**
+ * Entity-centric reflection: pick entities that have accumulated enough
+ * mentions since their last entity_profile chunk, and have the LLM write
+ * a short "what do we know about X" summary. The result is stored as
+ * kind='entity_profile' AND indexed via chunk_indexes(kind='entity_ref')
+ * so future graph_walk for that entity finds the profile directly.
+ *
+ * This is the GraphRAG community-summary idea, scoped down to ONE
+ * entity at a time (cheap; no Leiden clustering needed). The "提炼"
+ * judgement test is satisfied:
+ *   raw mentions → one dense reusable profile chunk (importance 0.7,
+ *   pinned, T0-eligible) → future questions about this entity skip the
+ *   N-chunk dump and hit one paragraph.
+ */
+
+const ENTITY_REFLECTION_MIN_MENTIONS = 8;
+const ENTITY_REFLECTION_LOOKBACK_DAYS = 30;
+const ENTITY_REFLECTION_PROFILE_TTL_DAYS = 7;
+const ENTITY_REFLECTION_MAX_PER_RUN = 3;
+const ENTITY_REFLECTION_MAX_CHUNKS_PER_ENTITY = 60;
+const ENTITY_REFLECTION_MAX_CHARS = 6000;
+
+const ENTITY_SYSTEM_PROMPT =
+  "You are summarising what the agent's memory knows about ONE specific " +
+  "entity. Read all the mentions (chronological order, oldest first) and " +
+  "write a 3-6 sentence factual summary in the user's language. Focus on: " +
+  "what this entity IS (one phrase), notable facts, relationships, and any " +
+  "preferences / patterns. No greetings, no caveats, no markdown headers. " +
+  "Just the summary text.";
+
+export type EntityReflectionOutcome = {
+  entityId: string;
+  entityName: string;
+  ok: boolean;
+  mentionsConsidered: number;
+  profileChunkId?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  error?: string;
+};
+
+export async function runEntityReflectionForAgent(
+  deps: ReflectionDeps,
+  agentId: string,
+): Promise<EntityReflectionOutcome[]> {
+  // 1. Find candidate entities: ≥N mentions in lookback, no entity_profile in TTL window.
+  const candidates = await deps.pool.query<{
+    id: string; canonical_name: string; type: string; mention_count: number;
+  }>(
+    `SELECT e.id::text, e.canonical_name, e.type,
+            count(DISTINCT ci.chunk_id)::int AS mention_count
+       FROM structured.entities e
+       JOIN semantic.chunk_indexes ci
+         ON ci.kind = 'entity_ref' AND ci.value = e.id::text
+       JOIN semantic.chunks c ON c.id = ci.chunk_id
+      WHERE c.agent_id = $1
+        AND c.created_at > now() - ($2 || ' days')::interval
+        AND e.deleted_at IS NULL
+        AND c.kind NOT IN ('entity_profile', 'reflection', 'profile')
+        AND NOT EXISTS (
+          SELECT 1
+            FROM semantic.chunks p
+            JOIN semantic.chunk_indexes pi
+              ON pi.chunk_id = p.id AND pi.kind = 'entity_ref' AND pi.value = e.id::text
+           WHERE p.kind = 'entity_profile'
+             AND p.agent_id = $1
+             AND p.created_at > now() - ($3 || ' days')::interval
+        )
+      GROUP BY e.id, e.canonical_name, e.type
+      HAVING count(DISTINCT ci.chunk_id) >= $4
+      ORDER BY count(DISTINCT ci.chunk_id) DESC
+      LIMIT $5`,
+    [
+      agentId,
+      String(ENTITY_REFLECTION_LOOKBACK_DAYS),
+      String(ENTITY_REFLECTION_PROFILE_TTL_DAYS),
+      ENTITY_REFLECTION_MIN_MENTIONS,
+      ENTITY_REFLECTION_MAX_PER_RUN,
+    ],
+  );
+
+  const outcomes: EntityReflectionOutcome[] = [];
+  for (const e of candidates.rows) {
+    const outcome = await reflectOnEntity(deps, agentId, e);
+    outcomes.push(outcome);
+  }
+  return outcomes;
+}
+
+async function reflectOnEntity(
+  deps: ReflectionDeps,
+  agentId: string,
+  entity: { id: string; canonical_name: string; type: string; mention_count: number },
+): Promise<EntityReflectionOutcome> {
+  // 2. Gather mention chunks.
+  const chunks = await deps.pool.query<{ text: string; source: string; created_at: Date }>(
+    `SELECT c.text, c.source, c.created_at
+       FROM semantic.chunks c
+       JOIN semantic.chunk_indexes ci
+         ON ci.chunk_id = c.id AND ci.kind = 'entity_ref' AND ci.value = $2
+      WHERE c.agent_id = $1
+        AND c.created_at > now() - ($3 || ' days')::interval
+        AND c.kind NOT IN ('entity_profile', 'reflection', 'profile')
+      ORDER BY c.created_at DESC
+      LIMIT $4`,
+    [agentId, entity.id, String(ENTITY_REFLECTION_LOOKBACK_DAYS), ENTITY_REFLECTION_MAX_CHUNKS_PER_ENTITY],
+  );
+  if (chunks.rowCount === 0) {
+    return {
+      entityId: entity.id, entityName: entity.canonical_name,
+      ok: false, mentionsConsidered: 0, error: "no-mention-chunks",
+    };
+  }
+
+  // 3. Chronological dump, oldest first, cap by char count.
+  const ordered = chunks.rows.toReversed();
+  let dump = "";
+  let considered = 0;
+  for (const c of ordered) {
+    const line = `[${c.created_at.toISOString()}] (${c.source}) ${c.text}\n`;
+    if (dump.length + line.length > ENTITY_REFLECTION_MAX_CHARS) {break;}
+    dump += line;
+    considered += 1;
+  }
+  const userPrompt =
+    `Entity: ${entity.canonical_name} (type: ${entity.type})\n` +
+    `Mentions (chronological, ${considered}):\n\n${dump}`;
+
+  // 4. LLM call.
+  const llmResult = await deps.llm.chat({
+    systemPrompt: ENTITY_SYSTEM_PROMPT,
+    userPrompt,
+    maxOutputTokens: 400,
+    temperature: 0.3,
+  });
+  if (!llmResult.ok) {
+    return {
+      entityId: entity.id, entityName: entity.canonical_name,
+      ok: false, mentionsConsidered: considered, error: llmResult.error,
+    };
+  }
+  const summary = llmResult.text.trim();
+  if (summary.length < 20) {
+    return {
+      entityId: entity.id, entityName: entity.canonical_name,
+      ok: false, mentionsConsidered: considered, error: "summary-too-short",
+      inputTokens: llmResult.inputTokens, outputTokens: llmResult.outputTokens,
+    };
+  }
+
+  // 5. Write chunk + back-link to the entity via chunk_indexes so future
+  // graph_walk for this entity surfaces the profile.
+  const chunkId = await writeChunk(deps, {
+    agentId,
+    text: summary,
+    kind: "entity_profile",
+    source: `entity-reflection:${entity.canonical_name.slice(0, 60)}`,
+    retentionClass: "pinned",
+    importance: 0.7,
+  });
+  if (chunkId) {
+    await deps.pool.query(
+      `INSERT INTO semantic.chunk_indexes (chunk_id, kind, value)
+         VALUES ($1, 'entity_ref', $2)
+       ON CONFLICT DO NOTHING`,
+      [chunkId, entity.id],
+    ).catch(() => undefined);
+  }
+  return {
+    entityId: entity.id,
+    entityName: entity.canonical_name,
+    ok: chunkId !== null,
+    mentionsConsidered: considered,
+    profileChunkId: chunkId ?? undefined,
+    inputTokens: llmResult.inputTokens,
+    outputTokens: llmResult.outputTokens,
+  };
+}
+
 /* ----------------------- daemon (interval + event-driven) ----------------- */
 
 export type ReflectionDaemonHandle = {
@@ -326,6 +507,20 @@ export function startReflectionDaemon(args: {
         );
       } else if (!outcome.ok) {
         args.logger.warn(`memory-postgres: reflection (${reason}) agent=${agentId} err=${outcome.error}`);
+      }
+      // Entity-centric reflection: same trigger; runs alongside time-window
+      // reflection. Internally throttled by the 7-day TTL filter in the
+      // candidate query, so back-to-back triggers are no-ops.
+      const entOutcomes = await runEntityReflectionForAgent(args.deps, agentId);
+      const writtenCount = entOutcomes.filter((o) => o.ok && o.profileChunkId).length;
+      if (writtenCount > 0) {
+        const summary = entOutcomes
+          .filter((o) => o.ok && o.profileChunkId)
+          .map((o) => `${o.entityName}(${o.mentionsConsidered})`)
+          .join(", ");
+        args.logger.info(
+          `memory-postgres: entity-reflection (${reason}) agent=${agentId} wrote=${writtenCount} → ${summary}`,
+        );
       }
     } catch (err) {
       args.logger.warn(`memory-postgres: reflection (${reason}) failed for ${agentId}: ${(err as Error).message}`);
