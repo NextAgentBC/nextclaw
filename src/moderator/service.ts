@@ -61,6 +61,12 @@ export type ModeratorServiceConfig = {
    *  worker_roles). Default "main". Set to something else if you run a
    *  second openclaw instance against the same Postgres. */
   agentId?: string;
+  /** Tavily API key — used by the worker's `web_search` tool when
+   *  cfg.credbroker.tavilyUrl isn't set. We reuse OpenClaw's tavily plugin
+   *  credential here (read at startup from
+   *  `plugins.entries.tavily.config.webSearch.apiKey`) so operators don't
+   *  configure Tavily twice. Falls back to `TAVILY_API_KEY` env if undefined. */
+  tavilyApiKey?: string;
   /** Logger; the api.logger from openclaw works. */
   logger: { info: (m: string) => void; warn: (m: string) => void };
   /** Per-user debounce window in ms. Default 1500. */
@@ -278,6 +284,7 @@ export function startModeratorService(config: ModeratorServiceConfig): Moderator
           embedding: config.embedding,
           cfg: config.cfg,
           agentId: agentId,
+          tavilyApiKey: config.tavilyApiKey ?? null,
           logger: config.logger,
         };
         const viewer = { userId: senderUserId, chatId };

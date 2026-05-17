@@ -43,10 +43,13 @@ export type ToolRuntimeDeps = {
   cfg: ResolvedMemoryPostgresConfig;
   agentId: string;
   viewer: ViewerScope | undefined;
-  /** Optional override for the Tavily endpoint. When omitted the
-   *  executor falls back to env-var resolution. Service.ts passes
-   *  `cfg.credbroker.tavilyUrl` here so the runtime URL is config-driven. */
+  /** Optional override for the Tavily endpoint URL (e.g. a credbroker
+   *  proxy). Set by service.ts from `cfg.credbroker.tavilyUrl`. */
   webSearchUrl?: string | null;
+  /** Optional Tavily API key — typically reused from OpenClaw's tavily
+   *  plugin config so operators don't configure Tavily twice. Used when
+   *  webSearchUrl isn't set; we then POST to api.tavily.com directly. */
+  tavilyApiKey?: string | null;
 };
 
 /* ------------------------------- definitions ------------------------------ */
@@ -137,7 +140,7 @@ export async function executeTool(
     return execMemorySearch(deps, call.args);
   }
   if (call.name === "web_search") {
-    return execWebSearch(call.args, deps.webSearchUrl ?? null);
+    return execWebSearch(call.args, deps.webSearchUrl ?? null, deps.tavilyApiKey ?? null);
   }
   return {
     name: call.name,
@@ -209,20 +212,22 @@ const WEB_SEARCH_TIMEOUT_MS = 12_000;
 const WEB_SEARCH_SNIPPET_CHARS = 400;
 
 /**
- * Resolve the Tavily endpoint:
- *   1. Explicit `webSearchUrl` from ToolRuntimeDeps (set by service.ts
- *      from `cfg.credbroker.tavilyUrl`) — preferred path.
- *   2. `NEXTCLAW_WEB_SEARCH_URL` env override.
- *   3. `TAVILY_API_KEY` env → direct api.tavily.com.
- *
- * Returns null when web_search is NOT configured on this deployment. The
- * caller (execWebSearch) then returns an honest error to the LLM rather
- * than silently hitting a hardcoded URL that only works in one developer's
- * tailnet — see the original bug: a placeholder URL pointing at the
- * author's home network would time out for everyone else.
+ * Resolve the Tavily endpoint. Priority order (first match wins):
+ *   1. `webSearchUrl` from deps (credbroker proxy URL set in cfg).
+ *   2. `tavilyApiKey` from deps — typically REUSED from OpenClaw's
+ *      `plugins.entries.tavily.config.webSearch.apiKey` so operators
+ *      who already configured tavily for codex don't configure it
+ *      twice. Hits api.tavily.com directly.
+ *   3. `NEXTCLAW_WEB_SEARCH_URL` env override (operator escape hatch).
+ *   4. `TAVILY_API_KEY` env → direct api.tavily.com (legacy env path).
+ *   5. null → execWebSearch returns an honest error to the LLM.
  */
-function resolveWebSearchEndpoint(fromDeps: string | null): { url: string; apiKey?: string } | null {
-  if (fromDeps) {return { url: fromDeps, apiKey: process.env.TAVILY_API_KEY };}
+function resolveWebSearchEndpoint(
+  fromDeps: string | null,
+  depsApiKey: string | null,
+): { url: string; apiKey?: string } | null {
+  if (fromDeps) {return { url: fromDeps, apiKey: depsApiKey ?? process.env.TAVILY_API_KEY };}
+  if (depsApiKey) {return { url: "https://api.tavily.com/search", apiKey: depsApiKey };}
   const explicit = process.env.NEXTCLAW_WEB_SEARCH_URL;
   if (explicit) {
     return { url: explicit, apiKey: process.env.TAVILY_API_KEY };
@@ -237,8 +242,9 @@ function resolveWebSearchEndpoint(fromDeps: string | null): { url: string; apiKe
 async function execWebSearch(
   args: Record<string, unknown>,
   webSearchUrl: string | null,
+  tavilyApiKey: string | null,
 ): Promise<ToolResult> {
-  const endpoint = resolveWebSearchEndpoint(webSearchUrl);
+  const endpoint = resolveWebSearchEndpoint(webSearchUrl, tavilyApiKey);
   if (!endpoint) {
     return {
       name: "web_search",

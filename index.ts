@@ -419,6 +419,14 @@ export default definePluginEntry({
               channels?: { telegram?: { botToken?: string } };
               commands?: { ownerAllowFrom?: string[] };
               gateway?: { auth?: { token?: string } };
+              plugins?: {
+                entries?: {
+                  tavily?: {
+                    enabled?: boolean;
+                    config?: { webSearch?: { apiKey?: string; apiKeyEnv?: string } };
+                  };
+                };
+              };
             };
             const botToken = live.channels?.telegram?.botToken ?? "";
             const ownerEntry = (live.commands?.ownerAllowFrom ?? [])
@@ -426,6 +434,23 @@ export default definePluginEntry({
             const ownerUserId = ownerEntry ? ownerEntry.replace(/^telegram:/, "") : undefined;
             const dashTokenEnv = cfg.dashboard.tokenEnv;
             const ingestToken = dashTokenEnv ? (process.env[dashTokenEnv] ?? "") : "";
+
+            // Reuse OpenClaw's tavily plugin credential when the operator
+            // has already configured it for codex — saves them configuring
+            // the same key twice. Resolution: inline apiKey wins; otherwise
+            // apiKeyEnv → env lookup; otherwise undefined (worker falls
+            // through to TAVILY_API_KEY env / credbroker / null).
+            const openclawTavily = live.plugins?.entries?.tavily;
+            let tavilyApiKey: string | undefined;
+            if (openclawTavily?.enabled !== false && openclawTavily?.config?.webSearch) {
+              const ws = openclawTavily.config.webSearch;
+              if (typeof ws.apiKey === "string" && ws.apiKey.length > 0) {
+                tavilyApiKey = ws.apiKey;
+              } else if (typeof ws.apiKeyEnv === "string") {
+                const v = process.env[ws.apiKeyEnv];
+                if (v && v.length > 0) {tavilyApiKey = v;}
+              }
+            }
 
             if (!botToken) {
               api.logger.warn(
@@ -466,6 +491,7 @@ export default definePluginEntry({
                 cfg,
                 pool,
                 agentId: cfg.moderator.agentId,
+                tavilyApiKey,
                 logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
                 debounceMs: cfg.moderator.debounceMs,
               });
