@@ -54,6 +54,73 @@ let MODULE_MODERATOR_HANDLE: ModeratorServiceHandle | null = null;
 let MODULE_TRANSCRIPT_WATCHERS: TranscriptWatcherHandle[] = [];
 let MODULE_REFLECTION_HANDLE: ReflectionDaemonHandle | null = null;
 let MODULE_INGEST_DEPS: import("./src/ingest/pipeline.js").IngestDeps | null = null;
+/** Set on service start when we have what /dashboard needs (bot token,
+ *  owner allowlist, public URL). Cleared on stop. */
+type DashboardCommandCtx = {
+  telegram: import("./src/moderator/telegram-api.js").TelegramBotApi;
+  publicUrl: string;
+  ownerIds: Set<string>;
+};
+let MODULE_DASHBOARD_CMD: DashboardCommandCtx | null = null;
+
+/**
+ * Handle `/dashboard` text from a Telegram user. Replies with an
+ * inline-keyboard WebApp button that opens the dashboard inside Telegram.
+ * Owner-only (checked against `commands.ownerAllowFrom`). Returns true
+ * when the message was handled (caller should claim); false to let
+ * normal routing continue.
+ */
+async function handleDashboardCommand(
+  api: { logger: { info: (m: string) => void; warn: (m: string) => void } },
+  ctxObj: { conversationId?: string; senderId?: string },
+): Promise<boolean> {
+  const cmd = MODULE_DASHBOARD_CMD;
+  if (!cmd) {
+    api.logger.warn("dashboard cmd: not configured (publicUrl + telegram bot token both required)");
+    return false;
+  }
+  const senderRaw = (ctxObj.senderId ?? "").replace(
+    /^(?:channel:|chat:|user:|tg-?|telegram:|slack:|discord:|whatsapp:)/,
+    "",
+  );
+  if (!cmd.ownerIds.has(senderRaw)) {
+    api.logger.info(`dashboard cmd: rejecting non-owner sender=${senderRaw}`);
+    // Reply with a polite refusal (still consume the message).
+    const chatId = (ctxObj.conversationId ?? "").replace(
+      /^(?:channel:|chat:|user:|tg-?|telegram:|slack:|discord:|whatsapp:)/,
+      "",
+    );
+    if (chatId) {
+      await cmd.telegram.sendMessage({
+        chatId,
+        text: "Dashboard 仅限运营者使用。",
+      }).catch(() => undefined);
+    }
+    return true;
+  }
+  const chatId = (ctxObj.conversationId ?? "").replace(
+    /^(?:channel:|chat:|user:|tg-?|telegram:|slack:|discord:|whatsapp:)/,
+    "",
+  );
+  if (!chatId) {return false;}
+  // WebApp button: when tapped, Telegram opens the URL inside its
+  // in-app browser AND injects window.Telegram.WebApp.initData which
+  // the dashboard JS exchanges for a session token at
+  // /api/auth/telegram. No URL token leakage.
+  await cmd.telegram.sendMessage({
+    chatId,
+    text: "📊 OpenClaw Memory Dashboard\n\n点下面的按钮，dashboard 在 Telegram 内部打开（自动鉴权，只有你看得到）。",
+    replyMarkup: {
+      inline_keyboard: [[{
+        text: "📈 Open Dashboard",
+        web_app: { url: cmd.publicUrl },
+      }]],
+    },
+  });
+  api.logger.info(`dashboard cmd: sent WebApp button to sender=${senderRaw}`);
+  return true;
+}
+
 import { startTranscriptWatcherDaemon, type TranscriptWatcherHandle } from "./src/workers/transcript-watcher.js";
 import { startShadowComparator } from "./src/workers/shadow-comparator.js";
 import { evaluateGuards, runDailyAnalyzer } from "./src/workers/tuning.js";
@@ -139,18 +206,30 @@ export default definePluginEntry({
     // forwards the inbound event into the Moderator pipeline; before_dispatch
     // only decides whether to suppress codex.
     api.on("before_dispatch", async (event, hookCtx) => {
-      const ctxObj = hookCtx as { channelId?: string; conversationId?: string };
+      const ctxObj = hookCtx as { channelId?: string; conversationId?: string; senderId?: string };
       if (ctxObj?.channelId !== "telegram") {return;}
+      const ev = event as { content?: string; isGroup?: boolean };
+      const content = (ev.content ?? "").trim();
+
+      // 0. /dashboard command — open the dashboard WebApp inline. Owner
+      //    only. Works in both DM and group. Always claims (the response
+      //    is sent below).
+      if (/^\/dashboard(?:@\w+_bot)?(?:\s|$)/i.test(content)) {
+        const handled = await handleDashboardCommand(api, ctxObj);
+        if (handled) {return { handled: true };}
+        // If we couldn't handle (missing publicUrl, etc.), fall through
+        // and let normal routing take over so the user sees SOMETHING.
+      }
+
       // event.isGroup is set directly by the dispatcher (see
       // hook-types: PluginHookBeforeDispatchEvent), preferred over
       // re-parsing the conversation id.
-      const ev = event as { content?: string; isGroup?: boolean };
       const isGroup = ev.isGroup === true ||
         (ctxObj.conversationId ?? "")
           .replace(/^(?:channel:|chat:|user:|tg-?|telegram:|slack:|discord:|whatsapp:)/, "")
           .startsWith("-");
       if (!isGroup) {return;} // DMs continue to codex
-      const addressed = /@\w+_bot|@bot\b|^\/(start|ask|help)/i.test(ev.content ?? "");
+      const addressed = /@\w+_bot|@bot\b|^\/(start|ask|help)/i.test(content);
       if (!addressed) {return;} // group chatter not for the bot — codex won't reply anyway
       api.logger.info(
         `[moderator/hook] before_dispatch CLAIMED: conv=${ctxObj.conversationId} ` +
@@ -306,8 +385,46 @@ export default definePluginEntry({
         if (cfg.dashboard.enabled) {
           try {
             const pool = await getPool(activePoolCfg);
-            server = await startDashboardServer(pool, cfg);
-            api.logger.info(`memory-postgres: dashboard listening at ${server.url}`);
+            // Pull Telegram bot token + owner allowlist so the dashboard
+            // can authenticate WebApp users via initData. When either is
+            // missing, the dashboard falls back to global-token only.
+            const liveCfg = ctx.config as unknown as {
+              channels?: { telegram?: { botToken?: string } };
+              commands?: { ownerAllowFrom?: string[] };
+            };
+            const tgBotToken = liveCfg.channels?.telegram?.botToken;
+            const allowedTgIds = new Set<string>(
+              (liveCfg.commands?.ownerAllowFrom ?? [])
+                .filter((s): s is string => typeof s === "string" && s.startsWith("telegram:"))
+                .map((s) => s.replace(/^telegram:/, "")),
+            );
+            server = await startDashboardServer(pool, cfg, {
+              telegramBotToken: tgBotToken,
+              allowedTelegramUserIds: allowedTgIds.size > 0 ? allowedTgIds : undefined,
+            });
+            api.logger.info(
+              `memory-postgres: dashboard listening at ${server.url}` +
+                (tgBotToken && allowedTgIds.size > 0
+                  ? ` (telegram-webapp-auth: ${allowedTgIds.size} allowed user(s))`
+                  : ""),
+            );
+            // Wire `/dashboard` Telegram command iff we have everything:
+            // a publicly reachable HTTPS URL + bot token + owner allowlist.
+            if (cfg.dashboard.publicUrl && tgBotToken && allowedTgIds.size > 0) {
+              const { TelegramBotApi: TgApi } = await import("./src/moderator/telegram-api.js");
+              MODULE_DASHBOARD_CMD = {
+                telegram: new TgApi({ botToken: tgBotToken }),
+                publicUrl: cfg.dashboard.publicUrl,
+                ownerIds: allowedTgIds,
+              };
+              api.logger.info(
+                `memory-postgres: /dashboard command armed → publicUrl=${cfg.dashboard.publicUrl}`,
+              );
+            } else if (cfg.dashboard.publicUrl) {
+              api.logger.warn(
+                "memory-postgres: dashboard.publicUrl set but missing telegram bot token or ownerAllowFrom — /dashboard command not armed",
+              );
+            }
           } catch (err) {
             api.logger.warn(
               `memory-postgres: dashboard failed to start: ${(err as Error).message}`,
@@ -624,6 +741,7 @@ export default definePluginEntry({
         }
         MODULE_MODERATOR_HANDLE = null;
         MODULE_INGEST_DEPS = null;
+        MODULE_DASHBOARD_CMD = null;
         if (moderatorEventUnsub) {
           try { moderatorEventUnsub(); } catch { /* ignore */ }
           moderatorEventUnsub = null;

@@ -4,6 +4,11 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenClaw Memory · memory-postgres</title>
+  <!-- Telegram WebApp SDK — loaded eagerly so the JS bootstrap can
+       detect window.Telegram and auto-exchange initData for a session
+       token before the dashboard makes any /api/* calls. Harmless when
+       not running inside Telegram (the SDK just defines an empty global). -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <link rel="stylesheet" href="/dashboard.css" />
 </head>
 <body>
