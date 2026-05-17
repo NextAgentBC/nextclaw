@@ -441,7 +441,7 @@ async function scenarioJ_entityReflection() {
     [entityId, entityName],
   );
   const chunkIds = [];
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 14; i++) {
     const cid = uuid();
     const text = `Yao mentioned ${entityName} — context note ${i+1}: it ${i % 2 === 0 ? "ships next Tuesday" : "uses pgvector + HNSW"}.`;
     const er = await embedding.embed({ inputs: [text] }).catch(() => null);
@@ -480,7 +480,7 @@ async function scenarioJ_entityReflection() {
   );
   console.log(`  outcomes: ${outcomes.length} candidate(s)`);
   for (const o of outcomes) {
-    console.log(`    - ${o.entityName} ok=${o.ok} mentions=${o.mentionsConsidered} chunk=${o.profileChunkId?.slice(0,8) ?? "-"}`);
+    console.log(`    - ${o.entityName} ok=${o.ok} mentions=${o.mentionsConsidered} chunk=${o.profileChunkId?.slice(0,8) ?? "-"} ${o.error ? "err=" + o.error : ""} tokens=${o.inputTokens}->${o.outputTokens}`);
   }
 
   // Verify: entity_profile chunk exists AND is back-indexed under this entity.

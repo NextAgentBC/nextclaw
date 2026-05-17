@@ -300,12 +300,21 @@ async function writeChunk(
  *   N-chunk dump and hit one paragraph.
  */
 
-const ENTITY_REFLECTION_MIN_MENTIONS = 8;
+const ENTITY_REFLECTION_MIN_MENTIONS = 12;
 const ENTITY_REFLECTION_LOOKBACK_DAYS = 30;
 const ENTITY_REFLECTION_PROFILE_TTL_DAYS = 7;
 const ENTITY_REFLECTION_MAX_PER_RUN = 3;
 const ENTITY_REFLECTION_MAX_CHUNKS_PER_ENTITY = 60;
 const ENTITY_REFLECTION_MAX_CHARS = 6000;
+/** Reflect ONLY on entity types that capture conversational meaning.
+ *  Excludes `file` and `repo` which the deterministic extractor collects
+ *  liberally from doc/KB ingest (file paths get extracted as entities).
+ *  Live test showed: a "repo/ssh/id_ed25519" entity fed Gemini a doc
+ *  dump it couldn't summarize, output truncated at 16 tokens. */
+const ENTITY_REFLECTION_TYPE_ALLOWLIST = [
+  "person", "concept", "project", "topic", "organization", "technology", "tool",
+];
+const ENTITY_REFLECTION_MIN_SUMMARY_CHARS = 80;
 
 const ENTITY_SYSTEM_PROMPT =
   "You are summarising what the agent's memory knows about ONE specific " +
@@ -330,7 +339,10 @@ export async function runEntityReflectionForAgent(
   deps: ReflectionDeps,
   agentId: string,
 ): Promise<EntityReflectionOutcome[]> {
-  // 1. Find candidate entities: ≥N mentions in lookback, no entity_profile in TTL window.
+  // 1. Find candidate entities. Three filters stack:
+  //    - type in allowlist (drop file-path noise)
+  //    - mention count >= threshold (drop one-off mentions)
+  //    - no entity_profile chunk written for this entity in TTL window
   const candidates = await deps.pool.query<{
     id: string; canonical_name: string; type: string; mention_count: number;
   }>(
@@ -343,6 +355,7 @@ export async function runEntityReflectionForAgent(
       WHERE c.agent_id = $1
         AND c.created_at > now() - ($2 || ' days')::interval
         AND e.deleted_at IS NULL
+        AND e.type = ANY($6::text[])
         AND c.kind NOT IN ('entity_profile', 'reflection', 'profile')
         AND NOT EXISTS (
           SELECT 1
@@ -363,6 +376,7 @@ export async function runEntityReflectionForAgent(
       String(ENTITY_REFLECTION_PROFILE_TTL_DAYS),
       ENTITY_REFLECTION_MIN_MENTIONS,
       ENTITY_REFLECTION_MAX_PER_RUN,
+      ENTITY_REFLECTION_TYPE_ALLOWLIST,
     ],
   );
 
@@ -427,10 +441,13 @@ async function reflectOnEntity(
     };
   }
   const summary = llmResult.text.trim();
-  if (summary.length < 20) {
+  // Min-output guard: caught a real bug live where Gemini truncated to
+  // 16 tokens on a noisy entity ("`ssh/id_ed25519` refers to an SSH") and
+  // wrote it to cache as a "pinned" T0 chunk — worse than no profile.
+  if (summary.length < ENTITY_REFLECTION_MIN_SUMMARY_CHARS) {
     return {
       entityId: entity.id, entityName: entity.canonical_name,
-      ok: false, mentionsConsidered: considered, error: "summary-too-short",
+      ok: false, mentionsConsidered: considered, error: `summary-too-short(${summary.length}<${ENTITY_REFLECTION_MIN_SUMMARY_CHARS})`,
       inputTokens: llmResult.inputTokens, outputTokens: llmResult.outputTokens,
     };
   }
