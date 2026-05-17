@@ -112,6 +112,12 @@ export type MemoryPostgresConfig = {
     host?: string;
     port?: number;
     tokenEnv?: string;
+    /** Public HTTPS URL the dashboard is reachable at (e.g. a Cloudflare
+     *  Tunnel `*.trycloudflare.com` or your own subdomain). When set,
+     *  the `/dashboard` Telegram bot command replies with an inline
+     *  WebApp button that opens this URL inside the Telegram client.
+     *  Required HTTPS — Telegram refuses WebApp buttons on http://. */
+    publicUrl?: string;
   };
   /**
    * Plugin-internal git watchers. Each entry polls a local repo on its own
@@ -323,7 +329,7 @@ export type ResolvedMemoryPostgresConfig = {
       relevanceFollowupWindowMs: number;
     };
   };
-  dashboard: { enabled: boolean; host: string; port: number; tokenEnv?: string };
+  dashboard: { enabled: boolean; host: string; port: number; tokenEnv?: string; publicUrl?: string };
   tuning: { autoApplyEnabled: boolean };
   gitWatchers: ResolvedGitWatcher[];
   transcriptWatchers: ResolvedTranscriptWatcher[];
@@ -480,6 +486,9 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
       host: typeof dashboard.host === "string" ? dashboard.host : "127.0.0.1",
       port: num(dashboard.port, 8765),
       tokenEnv: dashboard.tokenEnv,
+      publicUrl: typeof dashboard.publicUrl === "string" && /^https:\/\//.test(dashboard.publicUrl)
+        ? dashboard.publicUrl.replace(/\/+$/, "")
+        : undefined,
     },
     tuning: { autoApplyEnabled: bool(tuning.autoApplyEnabled, false) },
     gitWatchers: (raw.gitWatchers ?? []).map(resolveGitWatcher),

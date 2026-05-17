@@ -59,6 +59,9 @@ export type SendMessageParams = {
   parseMode?: "Markdown" | "MarkdownV2" | "HTML";
   /** When set, the message is sent inside this forum topic. */
   messageThreadId?: number;
+  /** Optional reply markup — used to attach inline keyboards including
+   *  WebApp buttons. Forwarded verbatim to Telegram. */
+  replyMarkup?: { inline_keyboard: Array<Array<Record<string, unknown>>> };
 };
 
 export type EditMessageTextParams = {
@@ -107,6 +110,7 @@ export class TelegramBotApi {
       ...(params.replyToMessageId ? { reply_to_message_id: params.replyToMessageId } : {}),
       ...(params.parseMode ? { parse_mode: params.parseMode } : {}),
       ...(params.messageThreadId ? { message_thread_id: params.messageThreadId } : {}),
+      ...(params.replyMarkup ? { reply_markup: params.replyMarkup } : {}),
     }).then((o) => (o.ok ? { ok: true as const, result: { messageId: o.result.message_id } } : o));
   }
 

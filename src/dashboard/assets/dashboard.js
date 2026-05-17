@@ -1,8 +1,41 @@
 // Memory dashboard front-end (no framework).
-// Token: ?token=XXX in URL is captured into sessionStorage and forwarded
-// on every API + SSE call as X-Token (or query for SSE which can't custom-header).
+// Token sources, in priority order:
+//   1. Telegram WebApp initData → POST /api/auth/telegram → session token
+//   2. ?token=XXX in URL        → sessionStorage
+//   3. sessionStorage from prior load
+// All three converge on TOKEN sent as X-Token on /api/*, or ?token= on SSE
+// (which can't set custom headers).
 
 const TOKEN_KEY = "memdash:token";
+let TOKEN = null;
+
+// Promise that resolves once we know whether we have a token. /api/* fetches
+// await this so they don't 401 before the Telegram auth exchange completes.
+let _tokenReady;
+const tokenReadyPromise = new Promise((r) => { _tokenReady = r; });
+
+// 1. Telegram WebApp path: detect, ready, expand, exchange initData → token.
+const tg = (window.Telegram && window.Telegram.WebApp) || null;
+const isTgWebApp = !!(tg && typeof tg.initData === "string" && tg.initData.length > 0);
+if (isTgWebApp) {
+  try { tg.ready(); tg.expand(); } catch { /* SDK quirks ignored */ }
+  fetch("/api/auth/telegram", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ initData: tg.initData }),
+  })
+    .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t)))
+    .then((j) => {
+      if (j && j.ok && typeof j.token === "string") {
+        TOKEN = j.token;
+        sessionStorage.setItem(TOKEN_KEY, j.token);
+      }
+    })
+    .catch((err) => console.warn("Telegram WebApp auth failed:", err))
+    .finally(() => _tokenReady());
+}
+
+// 2. URL ?token= → sessionStorage (existing behaviour).
 const urlParams = new URLSearchParams(location.search);
 const tokenFromUrl = urlParams.get("token");
 if (tokenFromUrl) {
@@ -12,11 +45,19 @@ if (tokenFromUrl) {
   const cleanUrl = location.pathname + (cleanQuery ? `?${cleanQuery}` : "") + location.hash;
   history.replaceState(null, "", cleanUrl);
 }
-const TOKEN = sessionStorage.getItem(TOKEN_KEY);
-const headers = TOKEN ? { "X-Token": TOKEN } : {};
+
+// 3. Sync fallback: sessionStorage from this or a prior session.
+if (TOKEN === null) {
+  TOKEN = sessionStorage.getItem(TOKEN_KEY);
+  if (!isTgWebApp) {_tokenReady();}
+}
+
+const _hdr = () => (TOKEN ? { "X-Token": TOKEN } : {});
 const sseUrl = (path) => (TOKEN ? `${path}?token=${encodeURIComponent(TOKEN)}` : path);
-const apiFetch = (path, init = {}) =>
-  fetch(path, { ...init, headers: { ...(init.headers ?? {}), ...headers } });
+const apiFetch = async (path, init = {}) => {
+  await tokenReadyPromise;
+  return fetch(path, { ...init, headers: { ...(init.headers ?? {}), ..._hdr() } });
+};
 
 const $ = (id) => document.getElementById(id);
 
@@ -434,7 +475,11 @@ async function refresh() {
   }
 }
 
-function startStream() {
+async function startStream() {
+  // Wait for the auth path to settle before opening SSE — otherwise the
+  // initial EventSource opens with no token and gets a 401, only
+  // reconnecting once TOKEN is set. Gating here = clean first connect.
+  await tokenReadyPromise;
   const es = new EventSource(sseUrl("/api/stream"));
   const ul = $("stream");
 

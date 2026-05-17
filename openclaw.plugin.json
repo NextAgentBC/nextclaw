@@ -406,17 +406,13 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": {
-            "type": "boolean"
-          },
-          "host": {
-            "type": "string"
-          },
-          "port": {
-            "type": "number"
-          },
-          "tokenEnv": {
-            "type": "string"
+          "enabled": { "type": "boolean" },
+          "host": { "type": "string", "description": "127.0.0.1 (default) or 0.0.0.0 for Tailscale/LAN access." },
+          "port": { "type": "number" },
+          "tokenEnv": { "type": "string" },
+          "publicUrl": {
+            "type": "string",
+            "description": "Public HTTPS URL where this dashboard is reachable (e.g. a Cloudflare Tunnel hostname). Required for the Telegram `/dashboard` command to render a WebApp button. Must start with https://."
           }
         }
       },

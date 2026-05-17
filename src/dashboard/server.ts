@@ -31,6 +31,7 @@ import {
   storeCachedAnswer,
 } from "../cache/qa.js";
 import { ingestOne, type IngestInput } from "../ingest/pipeline.js";
+import { TelegramWebAppAuth } from "./telegram-auth.js";
 import { recall as recallFn, type RecallInput } from "../recall/router.js";
 import { readBotStats } from "./bot-stats.js";
 import { homedir } from "node:os";
@@ -74,12 +75,39 @@ async function ensureListener(pool: Pool): Promise<void> {
   await listenClient.query("LISTEN audit_events");
 }
 
-function tokenOk(req: IncomingMessage, expected: string | undefined): boolean {
+function tokenOk(
+  req: IncomingMessage,
+  expected: string | undefined,
+  tgAuth?: TelegramWebAppAuth,
+): boolean {
+  // Path 1: no token configured → wide open (local-only deploys)
   if (!expected) {return true;}
+  // Path 2: global static token via X-Token header or ?token=
   const headerTok = req.headers["x-token"];
   if (typeof headerTok === "string" && headerTok === expected) {return true;}
   const url = new URL(req.url ?? "/", "http://x");
-  return url.searchParams.get("token") === expected;
+  if (url.searchParams.get("token") === expected) {return true;}
+  // Path 3: per-user session token issued via /api/auth/telegram
+  // (the WebApp client POSTs initData → gets a session token → sends
+  //  it as X-Token on every subsequent /api/* call)
+  if (tgAuth && typeof headerTok === "string") {
+    if (tgAuth.consume(headerTok)) {return true;}
+  }
+  return false;
+}
+
+async function readBody(req: IncomingMessage, maxBytes = 4096): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let total = 0;
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {req.destroy(); reject(new Error("body too large"));}
+      else {chunks.push(chunk);}
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", (e) => reject(e));
+  });
 }
 
 function send(res: ServerResponse, status: number, body: string, contentType: string): void {
@@ -687,12 +715,34 @@ function handleStream(req: IncomingMessage, res: ServerResponse): void {
   });
 }
 
+export type DashboardServerExtras = {
+  /** Telegram bot token — when set together with `allowedTelegramUserIds`,
+   *  the dashboard accepts WebApp initData via POST /api/auth/telegram
+   *  and issues per-user session tokens. */
+  telegramBotToken?: string;
+  /** Telegram numeric user ids permitted to authenticate via WebApp.
+   *  Typically derived from `commands.ownerAllowFrom`. */
+  allowedTelegramUserIds?: Set<string>;
+};
+
 export async function startDashboardServer(
   pool: Pool,
   cfg: ResolvedMemoryPostgresConfig,
+  extras: DashboardServerExtras = {},
 ): Promise<DashboardServer> {
   await ensureListener(pool);
   const expected = cfg.dashboard.tokenEnv ? process.env[cfg.dashboard.tokenEnv] : undefined;
+
+  // Telegram WebApp auth — only enabled when both botToken and allowlist
+  // are present. Without one, the dashboard falls back to global-token
+  // auth only (existing behavior).
+  let tgAuth: TelegramWebAppAuth | undefined;
+  if (extras.telegramBotToken && extras.allowedTelegramUserIds && extras.allowedTelegramUserIds.size > 0) {
+    tgAuth = new TelegramWebAppAuth({
+      botToken: extras.telegramBotToken,
+      allowedUserIds: extras.allowedTelegramUserIds,
+    });
+  }
 
   // Static assets are public — they hold no user data, just the shell. Only
   // /api/* endpoints (which read audit + chunks data) require the token.
@@ -716,12 +766,47 @@ export async function startDashboardServer(
     const pathname = url.pathname;
     const isStatic = STATIC_PATHS.has(pathname);
 
-    if (!isStatic && !tokenOk(req, expected)) {
+    // /api/auth/telegram is open by design — it's HOW you get a token.
+    // The endpoint itself validates the initData HMAC + allowlist, so
+    // it can't be abused even though no upstream token gates it.
+    const isPublicAuth = pathname === "/api/auth/telegram";
+    if (!isStatic && !isPublicAuth && !tokenOk(req, expected, tgAuth)) {
       send(res, 401, "unauthorized", "text/plain");
       return;
     }
     try {
       switch (pathname) {
+        case "/api/auth/telegram": {
+          if (!tgAuth) {
+            sendJson(res, 503, { error: "telegram-webapp-auth-not-configured" });
+            return;
+          }
+          if (req.method !== "POST") {
+            sendJson(res, 405, { error: "POST required" });
+            return;
+          }
+          let initData = "";
+          try {
+            const body = await readBody(req);
+            const parsed = JSON.parse(body) as { initData?: string };
+            initData = parsed.initData ?? "";
+          } catch {
+            sendJson(res, 400, { error: "bad-json" });
+            return;
+          }
+          const result = tgAuth.verifyAndIssue(initData);
+          if (!result.ok) {
+            sendJson(res, 401, { error: result.error });
+            return;
+          }
+          sendJson(res, 200, {
+            ok: true,
+            token: result.token,
+            userId: result.userId,
+            expiresAtMs: result.expiresAtMs,
+          });
+          return;
+        }
         case "/":
         case "/index.html":
           await handleStaticAsset(res, "index.html");

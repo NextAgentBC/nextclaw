@@ -336,6 +336,68 @@ OpenClaw's tavily plugin registers a search tool for the **codex agent loop** �
 
 ---
 
+## 5b. Cloudflare Tunnel (optional — public dashboard URL for Telegram WebApp)
+
+**Why:** to open the memory dashboard from a **Telegram WebApp button** (`/dashboard` bot command), the dashboard needs a public HTTPS URL. Cloudflare Tunnel gives you one for free, with no port forwarding and no public IP required. Telegram's WebApp SDK requires HTTPS — `http://` URLs are silently rejected.
+
+### Quick path (5 minutes, ephemeral URL)
+
+```bash
+mkdir -p ~/bin
+curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') -o ~/bin/cloudflared
+chmod +x ~/bin/cloudflared
+~/bin/cloudflared tunnel --url http://localhost:8765 --no-autoupdate
+# Outputs: Your quick Tunnel has been created! Visit it at:
+#   https://random-words-here.trycloudflare.com
+```
+
+Paste the URL into `openclaw.json`:
+
+```jsonc
+"dashboard": {
+  "enabled": true, "host": "127.0.0.1", "port": 8765,
+  "tokenEnv": "NEXTCLAW_DASH_TOKEN",
+  "publicUrl": "https://random-words-here.trycloudflare.com"
+}
+```
+
+Restart OpenClaw. Send `/dashboard` to your bot. Tap the button.
+
+> ⚠️ Quick-tunnel URLs **change every time cloudflared restarts**. Fine for testing; for prod use a named tunnel (below).
+
+### Stable path (named tunnel — one-time setup, ~15 minutes)
+
+Requires: a Cloudflare account (free) + a domain on Cloudflare DNS.
+
+```bash
+~/bin/cloudflared tunnel login                            # browser auth
+~/bin/cloudflared tunnel create memory-dashboard          # creates UUID
+~/bin/cloudflared tunnel route dns memory-dashboard memory.yourdomain.com
+# Create ~/.cloudflared/config.yml:
+cat > ~/.cloudflared/config.yml <<'EOF'
+tunnel: memory-dashboard
+credentials-file: /home/youruser/.cloudflared/<UUID>.json
+ingress:
+  - hostname: memory.yourdomain.com
+    service: http://localhost:8765
+  - service: http_status:404
+EOF
+# Run as systemd --user service:
+~/bin/cloudflared service install
+sudo systemctl start cloudflared
+```
+
+Now `https://memory.yourdomain.com` is stable across restarts. Update `publicUrl` in openclaw.json and stop touching it.
+
+### How auth works (no token leakage)
+
+- The dashboard's `/api/*` endpoints reject any request without a valid token (`X-Token` header / `?token=` query).
+- When Telegram opens the WebApp, it injects `window.Telegram.WebApp.initData` — a signed payload containing the user's Telegram id + auth_date + HMAC.
+- The dashboard JS POSTs that initData to `/api/auth/telegram`. The server HMAC-validates with the bot token, checks `user.id` is in `commands.ownerAllowFrom`, and issues a **per-user session token** (in-memory, 1h TTL).
+- Session token rides as `X-Token` on all subsequent calls. No global token in the URL means **forwarding the link doesn't leak access**.
+
+---
+
 ## 6. Credbroker (optional — multi-host setups only)
 
 **Why:** if you have multiple machines on a Tailscale tailnet and want **zero API keys on caller hosts**, run a credential broker on one trusted "mainserver" and point everything at it. The broker injects credentials from its vault based on Tailscale identity.
