@@ -26,32 +26,56 @@ Everything past row 1 is optional. The plugin runs with just core; further servi
 
 **Why:** stores all chunks, embeddings, audit, cache. nextclaw is a thin layer over the DB — no in-memory state survives restart without it.
 
-**Get it:**
+**Get it:** pick whichever fits your environment.
+
+### Option A — Neon (cloud, free 0.5 GB, zero local deps)
+
+1. Go to <https://neon.tech> → sign up with GitHub (no card) → **Create project**
+2. Copy the connection string (looks like `postgresql://user:pwd@ep-xxx.neon.tech/neondb?sslmode=require`)
+3. In Neon's **SQL Editor** tab, run:
+
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS vector;
+   CREATE EXTENSION IF NOT EXISTS pg_trgm;
+   CREATE EXTENSION IF NOT EXISTS btree_gin;
+   ```
+
+4. Export:
+   ```bash
+   export PG_URL="postgresql://user:pwd@ep-xxx.neon.tech/neondb?sslmode=require"
+   ```
+
+> Neon auto-suspends idle databases. First query after a long idle wakes it up (~1–2 s); subsequent queries are fast again.
+
+### Option B — Docker (local, full control)
 
 ```bash
-# Bundled docker compose (recommended for a clean install)
-git clone https://github.com/NextAgentBC/nextclaw.git ~/nextclaw-tmp
-cd ~/nextclaw-tmp/dev
-docker compose up -d
+docker run -d --name nextclaw-pg --restart unless-stopped \
+  -e POSTGRES_USER=nextclaw -e POSTGRES_PASSWORD=nextclaw -e POSTGRES_DB=nextclaw \
+  -p 127.0.0.1:55432:5432 -v nextclaw_pg:/var/lib/postgresql/data \
+  pgvector/pgvector:pg16
+until docker exec nextclaw-pg pg_isready -U nextclaw >/dev/null 2>&1; do sleep 1; done
+docker exec nextclaw-pg psql -U nextclaw -d nextclaw -c \
+  "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin;"
+export PG_URL="postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw"
 ```
 
-This brings up `pgvector/pgvector:pg16` bound to `127.0.0.1:55432`, never the public interface. Volume `nextclaw_pg` persists across restarts.
+Bound to `127.0.0.1:55432` only, never the public interface. Volume `nextclaw_pg` persists across restarts.
 
-**Verify:**
+### Verify (either path)
 
 ```bash
-docker exec -e PGPASSWORD=nextclaw nextclaw-pg \
-  psql -U nextclaw -d nextclaw -c "SELECT extname FROM pg_extension;"
-# Must list: vector, pg_trgm, btree_gin
+psql "$PG_URL" -c "SELECT extname FROM pg_extension WHERE extname IN ('vector','pg_trgm','btree_gin');"
+# Must list all three. Install psql via `brew install libpq` or `apt-get install postgresql-client` if missing.
 ```
 
 **Config (in `~/.openclaw/openclaw.json` → `plugins.entries.memory-postgres.config`):**
 
 ```jsonc
-"postgres": { "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw" }
+"postgres": { "url": "<your $PG_URL>" }
 ```
 
-**Already have Postgres?** Skip the docker step; just give the plugin a URL with `vector`, `pg_trgm`, and `btree_gin` extensions installed. The plugin runs its own schema migrations on first start (`src/storage/schema/*.sql`).
+**Already have Postgres elsewhere?** Skip both options; just give the plugin a URL with `vector`, `pg_trgm`, and `btree_gin` extensions installed. The plugin runs its own schema migrations on first start (`dist/src/storage/schema/*.sql`).
 
 ---
 
@@ -434,23 +458,33 @@ Setting up a credbroker itself is out of scope here — see your tailnet's docs.
 
 ## 7. OpenClaw (host runtime — required)
 
-nextclaw is a plugin for [OpenClaw](https://github.com/openclaw/openclaw), not standalone. OpenClaw provides the agent runtime, channel ingress, hook system, and CLI.
+nextclaw is a plugin for [OpenClaw](https://github.com/openclaw/openclaw), not standalone. OpenClaw provides the agent runtime, channel ingress, hook system, and CLI. It ships its own Node runtime, so there are no extra prerequisites.
 
 **Install:**
 
 ```bash
-git clone --depth 1 https://github.com/openclaw/openclaw.git ~/openclaw
-cd ~/openclaw && pnpm install && pnpm build
+# macOS / Linux
+curl -fsSL https://openclaw.ai/install.sh | bash
+# Windows PowerShell
+#   iwr -useb https://openclaw.ai/install.ps1 | iex
+
+# Install the gateway daemon (launchd/systemd user service)
+openclaw onboard --install-daemon
 ```
 
 **Verify:**
 
 ```bash
-pnpm openclaw --version    # 2026.x.x
-pnpm openclaw doctor
+openclaw --version    # 2026.x.x
+openclaw doctor
 ```
 
-If `pnpm` is missing: `npm i -g pnpm@latest`.
+**Install nextclaw on top:**
+
+```bash
+openclaw plugins install git:github.com/NextAgentBC/nextclaw
+openclaw plugins list | grep memory-postgres   # confirm it's discovered
+```
 
 ---
 

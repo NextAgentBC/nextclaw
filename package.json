@@ -51,12 +51,17 @@
   },
   "openclaw": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node -e \"const fs=require('fs');const path=require('path');function cp(s,d){fs.mkdirSync(d,{recursive:true});for(const f of fs.readdirSync(s,{withFileTypes:true})){const sp=path.join(s,f.name),dp=path.join(d,f.name);if(f.isDirectory())cp(sp,dp);else fs.copyFileSync(sp,dp);}}cp('src/storage/schema','dist/src/storage/schema');cp('src/dashboard/assets','dist/src/dashboard/assets');\"",
+    "prepare": "npm run build",
     "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
   },
   "engines": {
     "node": ">=22"

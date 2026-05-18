@@ -55,51 +55,117 @@ Standalone OpenClaw skills that compose well with nextclaw:
 
 - **[openclaw-skill-reminder](https://github.com/NextAgentBC/openclaw-skill-reminder)** — privacy-conscious time-based reminders. The cron config file only sees opaque `reminder:<short-id>` names; the actual detail (names, addresses, appointments) lives in a mode-600 file. Used by `/dashboard` users to schedule follow-ups without leaking PII into `jobs.json`.
 
-## Quick start (Level A — memory only, ~20 min)
+## Quick start (~5 min on Neon, ~10 min on Docker)
+
+You need: a Postgres+pgvector database (free **Neon** cloud or local **Docker**) and a free **Jina** embedding key (30s signup). OpenClaw bundles Node 22+, so no extra runtime install.
 
 For the Telegram Moderator, web_search, and reflection upgrades, see the [INSTALL.md](docs/INSTALL.md) bolt-ons. **Read [SERVICES.md](docs/SERVICES.md) first** to know which external services each capability needs.
 
+### Step 1 — Install OpenClaw (the host runtime, one-liner)
+
 ```bash
-# 1. Install OpenClaw (the host runtime — required)
-git clone https://github.com/openclaw/openclaw.git ~/openclaw
-cd ~/openclaw && pnpm install && pnpm build
+curl -fsSL https://openclaw.ai/install.sh | bash
+openclaw onboard --install-daemon
+# Windows PowerShell:  iwr -useb https://openclaw.ai/install.ps1 | iex
+```
 
-# 2. Bring up Postgres + pgvector (docker compose included)
-git clone https://github.com/NextAgentBC/nextclaw.git ~/openclaw/extensions/memory-postgres
-cd ~/openclaw/extensions/memory-postgres/dev && docker compose up -d
+### Step 2 — Get a Postgres with pgvector (pick one)
 
-# 3. Get a free Jina embedding key — 30 seconds, no card, 1M tokens/key.
-#    https://jina.ai/embeddings/  → click "Get API key for free" → copy
+<details open><summary><strong>Option A — Neon (recommended, zero local deps, free 0.5 GB)</strong></summary>
+
+1. Go to <https://neon.tech> → **Sign up** (GitHub OAuth, no card) → **Create project**
+2. Copy the connection string shown after creation, e.g. `postgresql://user:pwd@ep-xxx.neon.tech/neondb?sslmode=require`
+3. In Neon's **SQL Editor** tab, paste and run:
+
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS vector;
+   CREATE EXTENSION IF NOT EXISTS pg_trgm;
+   CREATE EXTENSION IF NOT EXISTS btree_gin;
+   ```
+
+4. Export the connection string:
+
+   ```bash
+   export PG_URL="postgresql://user:pwd@ep-xxx.neon.tech/neondb?sslmode=require"
+   ```
+
+</details>
+
+<details><summary><strong>Option B — Docker (local, full control)</strong></summary>
+
+```bash
+docker run -d --name nextclaw-pg --restart unless-stopped \
+  -e POSTGRES_USER=nextclaw -e POSTGRES_PASSWORD=nextclaw -e POSTGRES_DB=nextclaw \
+  -p 127.0.0.1:55432:5432 -v nextclaw_pg:/var/lib/postgresql/data \
+  pgvector/pgvector:pg16
+until docker exec nextclaw-pg pg_isready -U nextclaw >/dev/null 2>&1; do sleep 1; done
+docker exec nextclaw-pg psql -U nextclaw -d nextclaw -c \
+  "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin;"
+export PG_URL="postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw"
+```
+
+</details>
+
+### Step 3 — Get a free Jina embedding key (30 seconds, no card, 1M tokens)
+
+<https://jina.ai/embeddings> → **Get API key for free** → copy
+
+```bash
 export JINA_API_KEY=jina_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-echo 'export JINA_API_KEY=...' >> ~/.bashrc
+```
 
-# 4. Build the plugin
-cd ~/openclaw && pnpm install && pnpm build
+Persist `PG_URL` and `JINA_API_KEY` so future shells still have them:
 
-# 5. Configure ~/.openclaw/openclaw.json — minimum to boot:
-cat > ~/.openclaw/openclaw.json <<'EOF'
-{
-  "plugins": {
-    "slots": { "memory": "memory-postgres" },
-    "entries": {
-      "memory-postgres": {
-        "enabled": true,
-        "config": {
-          "postgres": { "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw" },
-          "dashboard": { "enabled": true, "tokenEnv": "NEXTCLAW_DASH_TOKEN" }
-        }
-      }
-    }
-  }
-}
+```bash
+cat >> ~/.zshrc <<EOF   # or ~/.bashrc
+export PG_URL="$PG_URL"
+export JINA_API_KEY=$JINA_API_KEY
 EOF
-# (embedding block is OPTIONAL — defaults to Jina free with JINA_API_KEY)
+```
 
-# 6. Start
+### Step 4 — Install nextclaw into OpenClaw
+
+```bash
+openclaw plugins install git:github.com/NextAgentBC/nextclaw
+```
+
+The plugin's id is **`memory-postgres`** (regardless of install source). Other sources — npm, ClawHub, local dev — are listed under [Other install methods](#other-install-methods).
+
+### Step 5 — Wire it into your `openclaw.json` (safe merge — preserves existing config)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NextAgentBC/nextclaw/main/scripts/configure-minimal.mjs |
+  PG_URL="$PG_URL" node --input-type=module
+```
+
+This adds two keys to `~/.openclaw/openclaw.json` and leaves everything else (`gateway`, `agents`, `auth`, …) untouched:
+
+- `plugins.slots.memory = "memory-postgres"`
+- `plugins.entries["memory-postgres"]` with `postgres.url` + dashboard
+
+> Prefer to edit by hand? Paste the block below into your existing `plugins.entries` — the embedding block is optional, defaults to Jina free-tier when omitted.
+>
+> ```jsonc
+> "memory-postgres": {
+>   "enabled": true,
+>   "config": {
+>     "postgres": { "url": "<your PG_URL>" },
+>     "dashboard": { "enabled": true, "tokenEnv": "NEXTCLAW_DASH_TOKEN" }
+>   }
+> }
+> ```
+
+### Step 6 — Set the dashboard token and restart the daemon
+
+```bash
 export NEXTCLAW_DASH_TOKEN=$(openssl rand -hex 24)
-pnpm openclaw gateway start
+echo "export NEXTCLAW_DASH_TOKEN=$NEXTCLAW_DASH_TOKEN" >> ~/.zshrc
+openclaw gateway restart
+```
 
-# 7. Smoke test — write then recall
+### Step 7 — Smoke test: write a memory, then recall it
+
+```bash
 curl -sS -X POST http://127.0.0.1:8765/api/ingest \
   -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN" \
   -H 'Content-Type: application/json' \
@@ -114,19 +180,41 @@ curl -sS -X POST http://127.0.0.1:8765/api/recall \
 
 For the **full 0 → 1 walkthrough** with persona files, troubleshooting, Discord/Telegram bots, web_search, and multi-agent isolation, see **[docs/INSTALL.md](docs/INSTALL.md)**.
 
+### Other install methods
+
+`openclaw plugins install` accepts several sources — pick whichever matches your workflow:
+
+```bash
+# Git (recommended today — auto-builds during npm install via `prepare`)
+openclaw plugins install git:github.com/NextAgentBC/nextclaw
+openclaw plugins install git:github.com/NextAgentBC/nextclaw@v0.2.0   # pin a tag
+
+# npm (coming soon — the bare `nextclaw` npm name is taken by an unrelated
+# CLI, so this plugin will publish as a scoped name like @nextagentbc/nextclaw)
+# openclaw plugins install npm:@nextagentbc/nextclaw
+
+# ClawHub (coming soon — OpenClaw's official plugin hub)
+# openclaw plugins install clawhub:memory-postgres
+
+# Local dev (clone + live-reload symlink; runs from .ts source, no build needed)
+git clone https://github.com/NextAgentBC/nextclaw.git
+openclaw plugins install --link ./nextclaw
+```
+
 ### Installing nextclaw with help from an AI agent
 
 The docs are explicitly written to be read by both humans and LLM agents. If you'd like an agent to install nextclaw for you:
 
 1. Point the agent at **[docs/SERVICES.md](docs/SERVICES.md)** to enumerate which external services you'll need
 2. The agent walks through dependencies in order — Postgres → embedding → (optional) LLM → (optional) Telegram → (optional) Tavily — using each section's signup link, env-var name, and verification curl
-3. Final step: assemble the configured blocks into `openclaw.json` and run the smoke test in [INSTALL.md ⑦](docs/INSTALL.md#-start-then-verify-with-a-smoke-test)
+3. Final step: the agent runs `scripts/configure-minimal.mjs` from step 5 then the smoke test from step 7
 
 The "For AI agents" section at the bottom of SERVICES.md spells out the recommended dialogue flow.
 
 > **Want to self-host the embedder instead of Jina?** Run Ollama locally
-> and set `"embedding": { "format": "ollama" }` — the rest of the
-> embedding block fills itself in from per-format defaults. See
+> and add `"embedding": { "format": "ollama" }` to the `memory-postgres`
+> entry — the rest of the embedding block fills itself in from
+> per-format defaults. See
 > [docs/CONFIG.md#embedding](docs/CONFIG.md#embedding).
 >
 > ⚠️ **Embedding dimension is one-way.** It's auto-detected on first ingest

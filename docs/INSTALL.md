@@ -3,9 +3,11 @@
 This is the **fresh-machine** guide. If you already have OpenClaw + an
 embedding endpoint running, jump to step ④.
 
-Tested on Ubuntu 24.04 + macOS 14. Should work on any host with Docker +
-Node 22+. Estimated time: **30 minutes** for the memory-only path, **+15
-minutes** if you also want the Telegram Moderator + `web_search`.
+Tested on Ubuntu 24.04 + macOS 14. Should work on any host where OpenClaw's
+installer runs (Linux, macOS, Windows-WSL). Postgres can be cloud (Neon —
+zero local deps) or local (Docker). Estimated time: **15 minutes** for the
+memory-only path on Neon, **+15 minutes** if you also want the Telegram
+Moderator + `web_search`.
 
 > 📦 **Before you start: see [SERVICES.md](SERVICES.md)** for the
 > complete list of external services nextclaw can use (Postgres, Jina,
@@ -17,10 +19,10 @@ minutes** if you also want the Telegram Moderator + `web_search`.
 
 | Level | What works | External services needed | Estimated time |
 |---|---|---|---|
-| **A. Memory only** | Recall, ingest, dashboard, isolation | Postgres + Jina | 20 min |
-| **B. + Reflection** | Above + nightly memory consolidation | Postgres + Jina + Gemini | 25 min |
-| **C. + Telegram Moderator** | Above + group `@bot` answers | Postgres + Jina + Gemini + Telegram bot | 40 min |
-| **D. + Web search** | Above + worker `web_search` for current info | Postgres + Jina + Gemini + Telegram + Tavily | 45 min |
+| **A. Memory only** | Recall, ingest, dashboard, isolation | Postgres + Jina | 10 min |
+| **B. + Reflection** | Above + nightly memory consolidation | Postgres + Jina + Gemini | 15 min |
+| **C. + Telegram Moderator** | Above + group `@bot` answers | Postgres + Jina + Gemini + Telegram bot | 30 min |
+| **D. + Web search** | Above + worker `web_search` for current info | Postgres + Jina + Gemini + Telegram + Tavily | 35 min |
 
 This walkthrough builds **Level A first**, then has bolt-on sections for B/C/D you can run later.
 
@@ -29,47 +31,87 @@ This walkthrough builds **Level A first**, then has bolt-on sections for B/C/D y
 ## ① Install OpenClaw
 
 nextclaw is a *plugin* for [OpenClaw](https://github.com/openclaw/openclaw),
-not a standalone program. You install OpenClaw first, then drop nextclaw
-into its `extensions/` directory.
+not a standalone program. Install OpenClaw first; it bundles its own Node
+runtime so there are no extra prerequisites.
 
 ```bash
-# Clone OpenClaw at a stable tag (replace with the latest you want)
-git clone --depth 1 https://github.com/openclaw/openclaw.git ~/openclaw
-cd ~/openclaw
-pnpm install
-pnpm build
+# macOS / Linux — one-line installer
+curl -fsSL https://openclaw.ai/install.sh | bash
+
+# Windows (PowerShell):
+#   iwr -useb https://openclaw.ai/install.ps1 | iex
+
+# Run the onboarding wizard (installs the gateway as a launchd/systemd user service)
+openclaw onboard --install-daemon
 ```
 
 Verify:
 
 ```bash
-pnpm openclaw --version    # should print 2026.x.x
-pnpm openclaw doctor       # should mostly pass; warnings about disabled bundled plugins are fine
+openclaw --version    # should print 2026.x.x
+openclaw doctor       # should mostly pass; warnings about disabled bundled plugins are fine
 ```
 
-> If `pnpm` is not on your machine: `npm i -g pnpm@latest` then retry.
+> Onboard creates `~/.openclaw/openclaw.json` with sensible defaults
+> (gateway, auth profile, agent workspace). We will **add** the nextclaw
+> plugin entry to this file in step ⑤ — never overwrite it.
 
 ---
 
 ## ② Start Postgres + pgvector
 
+Pick **Option A (Neon, cloud, zero local deps)** or **Option B (Docker, local)**. Both produce a `PG_URL` env var the rest of this guide uses.
+
+### Option A — Neon (recommended, free 0.5 GB, no card)
+
+1. Go to <https://neon.tech> → **Sign up** with GitHub → **Create project**
+2. Copy the connection string shown after creation, e.g. `postgresql://user:pwd@ep-xxx.neon.tech/neondb?sslmode=require`
+3. In Neon's **SQL Editor** tab, paste and run:
+
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS vector;
+   CREATE EXTENSION IF NOT EXISTS pg_trgm;
+   CREATE EXTENSION IF NOT EXISTS btree_gin;
+   ```
+
+4. Export it:
+
+   ```bash
+   export PG_URL="postgresql://user:pwd@ep-xxx.neon.tech/neondb?sslmode=require"
+   ```
+
+> Neon auto-suspends idle databases. The first recall after a long idle
+> may take ~1–2 s while the compute wakes up; subsequent recalls are
+> fast again.
+
+### Option B — Docker (local, full control)
+
 ```bash
-git clone https://github.com/NextAgentBC/nextclaw.git ~/nextclaw-tmp
-cd ~/nextclaw-tmp/dev
-docker compose up -d
+docker run -d --name nextclaw-pg --restart unless-stopped \
+  -e POSTGRES_USER=nextclaw -e POSTGRES_PASSWORD=nextclaw -e POSTGRES_DB=nextclaw \
+  -p 127.0.0.1:55432:5432 -v nextclaw_pg:/var/lib/postgresql/data \
+  pgvector/pgvector:pg16
+
+# Wait for PG, then install the three extensions
+until docker exec nextclaw-pg pg_isready -U nextclaw >/dev/null 2>&1; do sleep 1; done
+docker exec nextclaw-pg psql -U nextclaw -d nextclaw -c \
+  "CREATE EXTENSION IF NOT EXISTS vector;
+   CREATE EXTENSION IF NOT EXISTS pg_trgm;
+   CREATE EXTENSION IF NOT EXISTS btree_gin;"
+
+export PG_URL="postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw"
 ```
 
-Verify:
+Verify either path:
 
 ```bash
-docker exec -e PGPASSWORD=nextclaw nextclaw-pg \
-  psql -U nextclaw -d nextclaw -c "SELECT version(); SELECT extname FROM pg_extension;"
-# Should list: vector, pg_trgm, btree_gin
+psql "$PG_URL" -c "SELECT extname FROM pg_extension WHERE extname IN ('vector','pg_trgm','btree_gin');"
+# Should list all three. (Install psql via `brew install libpq` or `apt-get install postgresql-client` if missing.)
 ```
 
-> The container binds **127.0.0.1:55432** on the host, never the public
-> interface. Volume `nextclaw_pg` persists across restarts. If you need to
-> wipe and start over: `docker compose down -v`.
+> The Docker container binds **127.0.0.1:55432** on the host, never the
+> public interface. Volume `nextclaw_pg` persists across restarts. To
+> wipe and start over: `docker rm -f nextclaw-pg && docker volume rm nextclaw_pg`.
 
 ---
 
@@ -139,108 +181,117 @@ mainserver. Example (replace IP / port with your own):
 
 ---
 
-## ④ Install nextclaw into OpenClaw's `extensions/`
+## ④ Install nextclaw into OpenClaw
+
+OpenClaw's plugin loader can pull the plugin straight from this repo. The
+`prepare` script in `package.json` auto-builds during `npm install`, so the
+compiled output is ready by the time the install completes.
 
 ```bash
-mv ~/nextclaw-tmp ~/openclaw/extensions/memory-postgres
-cd ~/openclaw
-pnpm install                # picks up the new extension's package.json
-pnpm build
+openclaw plugins install git:github.com/NextAgentBC/nextclaw
+
+# Optional: pin to a specific tag for reproducibility
+# openclaw plugins install git:github.com/NextAgentBC/nextclaw@v0.2.0
 ```
 
-> The directory **must** be named `memory-postgres` (not `nextclaw`)
-> because OpenClaw's `plugins.slots.memory` convention looks up plugins
-> by entry id and our manifest sets the id to `memory-postgres`. You can
-> rename later if you fork the manifest, but use this name for the
-> default install.
+Verify:
+
+```bash
+openclaw plugins list | grep memory-postgres
+# Should show:  memory-postgres  enabled  global:memory-postgres/dist/index.js  0.2.0
+```
+
+> The plugin's id is always **`memory-postgres`** regardless of where you
+> install it from — that's the key you reference in `openclaw.json`
+> under `plugins.slots.memory` and `plugins.entries`. The npm name and
+> the repo name ("nextclaw") are unrelated to the manifest id.
+
+> **Alternative sources** (all produce the same `memory-postgres` id):
+>
+> | Source | Command | When to use |
+> |---|---|---|
+> | npm (coming soon) | `openclaw plugins install npm:@nextagentbc/nextclaw` | Once published to npm under a scoped name |
+> | ClawHub (coming soon) | `openclaw plugins install clawhub:memory-postgres` | After listing in OpenClaw's official hub |
+> | Local checkout | `git clone … && openclaw plugins install --link ./nextclaw` | Hacking on the plugin — symlinked, runs from `.ts` source |
+> | Local tarball | `openclaw plugins install npm-pack:./nextclaw-0.2.0.tgz` | Air-gapped / offline installs |
 
 ---
 
 ## ⑤ Configure `~/.openclaw/openclaw.json`
 
-Create or edit this file. The **minimal** config — relying entirely on
-defaults — is:
+`openclaw onboard` (step ①) already wrote this file with `gateway`,
+`agents`, `auth`, and friends. You need to **merge** the nextclaw plugin
+entry into it without disturbing anything else.
+
+### Fastest: use the bundled helper (safe merge)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NextAgentBC/nextclaw/main/scripts/configure-minimal.mjs |
+  PG_URL="$PG_URL" node --input-type=module
+```
+
+This adds exactly two keys:
+
+- `plugins.slots.memory = "memory-postgres"`
+- `plugins.entries["memory-postgres"]` with your `postgres.url` and a
+  default dashboard block
+
+Every other key in the file is preserved byte-for-byte.
+
+### Manual: edit by hand
+
+Open `~/.openclaw/openclaw.json` in your editor. Under the existing
+`plugins.entries` object, add:
 
 ```jsonc
-{
-  "plugins": {
-    "slots": { "memory": "memory-postgres" },
-    "entries": {
-      "memory-postgres": {
-        "enabled": true,
-        "config": {
-          "postgres": { "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw" }
-        }
-      }
-    }
+"memory-postgres": {
+  "enabled": true,
+  "config": {
+    "postgres": { "url": "<your PG_URL>" },
+    "dashboard": { "enabled": true, "tokenEnv": "NEXTCLAW_DASH_TOKEN" }
   }
 }
 ```
 
-This boots with: Jina embedding (`JINA_API_KEY` env), default tiers,
-dashboard disabled, no transcript watchers, no reflection. Good enough
-to verify the smoke test in step ⑦.
+And under `plugins.slots`, add (or set) `"memory": "memory-postgres"`.
+The embedding block is optional — it defaults to Jina free-tier when
+omitted, picking up `JINA_API_KEY` from env.
 
-For a more realistic setup — dashboard on, watchers tailing your agent's
-session JSONL, gemini reflection nightly — copy this:
+### Realistic config — dashboard on, transcript watcher, nightly reflection
+
+For a setup closer to production, the full `memory-postgres.config` looks
+like this (paste-replace the value `configure-minimal.mjs` produced):
 
 ```jsonc
-{
-  "agents": {
-    "list": [
-      {
-        "id": "main",
-        "default": true,
-        "workspace": "~/.openclaw/workspace"
-      }
-    ]
-  },
-  "plugins": {
-    "slots": { "memory": "memory-postgres" },
-    "entries": {
-      "memory-postgres": {
-        "enabled": true,
-        "config": {
-          "postgres": {
-            "url": "postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw"
-          },
-          // Embedding block is OPTIONAL — defaults to Jina free-tier.
-          // Uncomment + edit to swap to ollama / openai / proxy:
-          // "embedding": { "format": "ollama" },
+"memory-postgres": {
+  "enabled": true,
+  "config": {
+    "postgres": { "url": "<your PG_URL>" },
 
-          "tiers": {
-            "t0SizeLimit": 50,
-            "t1SizeLimit": 500,
-            "t1TtlDays": 7,
-            "primeOnSessionStart": true
-          },
-          "dashboard": {
-            "enabled": true,
-            "host": "127.0.0.1",
-            "port": 8765,
-            "tokenEnv": "NEXTCLAW_DASH_TOKEN"
-          },
-          "transcriptWatchers": [{
-            "id": "agent-main",
-            "agentId": "main",
-            "dir": "~/.openclaw/agents/main/sessions",
-            "intervalMs": 10000,
-            "defaultImportance": 0.35
-          }],
-          // Optional: nightly reflection over recent conversations
-          // (writes summary chunks the agent can recall later).
-          // "reflection": {
-          //   "enabled": true,
-          //   "model": {
-          //     "format": "openai",
-          //     "baseUrl": "https://api.openai.com",
-          //     "model": "gpt-4o-mini",
-          //     "apiKeyEnv": "OPENAI_API_KEY"
-          //   }
-          // }
-        }
-      }
-    }
+    // Embedding block is OPTIONAL — defaults to Jina free-tier.
+    // Uncomment + edit to swap to ollama / openai / proxy:
+    // "embedding": { "format": "ollama" },
+
+    "tiers": {
+      "t0SizeLimit": 50,
+      "t1SizeLimit": 500,
+      "t1TtlDays": 7,
+      "primeOnSessionStart": true
+    },
+    "dashboard": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8765,
+      "tokenEnv": "NEXTCLAW_DASH_TOKEN"
+    },
+    "transcriptWatchers": [{
+      "id": "agent-main",
+      "agentId": "main",
+      "dir": "~/.openclaw/agents/main/sessions",
+      "intervalMs": 10000,
+      "defaultImportance": 0.35
+    }]
+    // For nightly reflection see the bolt-on section below.
   }
 }
 ```
@@ -285,16 +336,16 @@ EOF
 ## ⑦ Start, then verify with a smoke test
 
 ```bash
-# Generate a dashboard token (any random string)
+# Generate a dashboard token (any random string) and persist it
 export NEXTCLAW_DASH_TOKEN=$(openssl rand -hex 24)
+echo "export NEXTCLAW_DASH_TOKEN=$NEXTCLAW_DASH_TOKEN" >> ~/.zshrc   # or ~/.bashrc
 
-# Start the gateway
-pnpm openclaw gateway start
-# Or, if you've installed it as a systemd service: openclaw gateway restart
+# Restart the gateway daemon so it picks up the new plugin + config
+openclaw gateway restart
 ```
 
-On first start, the migration runner applies all DDL files in
-`extensions/memory-postgres/src/storage/schema/*.sql`. Watch for:
+On first start, the migration runner applies all DDL files bundled with
+the plugin (`~/.openclaw/extensions/memory-postgres/dist/src/storage/schema/*.sql`). Watch for:
 
 ```
 memory-postgres: capability + tools registered (memory_search, memory_store, dashboard, ...)
@@ -596,9 +647,15 @@ If you see this but no answer: Tavily call failed (check `journalctl ... | grep 
 ```
 ERROR: extension "vector" is not available
 ```
-→ The pgvector extension didn't install. Confirm you used the
-`pgvector/pgvector:pg16` image (not vanilla `postgres:16`). Re-run
-`docker compose down -v && docker compose up -d`.
+→ The pgvector extension didn't install.
+- **Neon**: run the three `CREATE EXTENSION` statements from step ②A in Neon's SQL Editor again.
+- **Docker**: confirm you used the `pgvector/pgvector:pg16` image (not vanilla `postgres:16`). Wipe and recreate: `docker rm -f nextclaw-pg && docker volume rm nextclaw_pg`, then re-run the docker run from step ②B.
+
+**`openclaw plugins install git:` fails with "requires compiled runtime output"**
+→ You're installing from a fork that's missing the `prepare` script. Check
+that `package.json` in the source has both `"prepare": "npm run build"` in
+`scripts` and `typescript` in `devDependencies`. The upstream
+`NextAgentBC/nextclaw` repo includes both since v0.2.0.
 
 **Dashboard says "unauthorized" or 401**
 → Token wasn't passed. Open the URL with `?token=$NEXTCLAW_DASH_TOKEN`
@@ -607,7 +664,7 @@ once; it's then stored in browser `sessionStorage` and forwarded as
 
 **Bot doesn't reply on Discord**
 → Check, in order:
-1. `pnpm openclaw doctor` — any "channel allowlist drops" warnings?
+1. `openclaw doctor` — any "channel allowlist drops" warnings?
 2. Did you @-mention by **user** id, not **role** id? Some clients
    autocomplete to a role with the same name as the bot. Disable
    `requireMention` temporarily to test.
@@ -623,19 +680,20 @@ nothing, the HNSW index probably wasn't built (it's lazy on first
 embed). Restart the gateway and re-write one chunk.
 
 **`<mem>{...}</mem>` text leaks into bot's reply on Discord**
-→ Your OpenClaw is older than May 2026. Pull the upstream
-`stripInternalRuntimeScaffolding` change or set `prompting.sidecar:
-"off"` in the memory-postgres config.
+→ Your OpenClaw is older than May 2026. Update with `openclaw update` or
+set `prompting.sidecar: "off"` in the memory-postgres config.
 
 **Dashboard panel is empty / events not streaming**
 → PG `LISTEN/NOTIFY` may be blocked. Check
-`SELECT pg_notify('test', 'hello')` works directly. SSE keeps a
-connection per client; reload the dashboard tab.
+`SELECT pg_notify('test', 'hello')` works directly. (Neon supports
+LISTEN/NOTIFY since 2023; check the Neon status page if it stops.) SSE
+keeps a connection per client; reload the dashboard tab.
 
-**`pnpm build` fails on the extension**
-→ Make sure the `peerDependencies: openclaw >= 2026.4.25` is satisfied.
-If you cloned a newer OpenClaw, you may hit Plugin SDK changes; pin
-OpenClaw to a known-good tag and rebuild.
+**Plugin install succeeds but gateway logs "memory-postgres config validation failed"**
+→ You ran `openclaw plugins install` before configuring `postgres.url`.
+The install step also tries to *activate* the plugin, which needs a
+valid config. Complete step ⑤ first (or rerun `configure-minimal.mjs`),
+then `openclaw gateway restart`.
 
 ---
 
