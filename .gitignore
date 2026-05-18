@@ -1,6 +1,10 @@
 node_modules/
-dist/
 *.log
+
+# NOTE: dist/ is intentionally tracked. OpenClaw's plugin installer runs
+# `npm install --omit=dev`, which strips the typescript compiler, so we
+# ship the compiled output in-tree. Rebuild before committing source
+# changes:  npm run build && git add dist/
 
 # Build artifacts
 .tsbuildinfo

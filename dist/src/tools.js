@@ -1,0 +1,401 @@
+/**
+ * Agent tools exposed by memory-postgres: `memory_search` and `memory_store`.
+ *
+ * These are thin wrappers over the recall router and ingest pipeline so the
+ * agent can read/write the long-term memory in turn.
+ */
+import { resolveConfig, validateConfig } from "./config.js";
+import { buildEmbeddingClientFromConfig } from "./embedding/client.js";
+import { forgetChunk, updateChunk } from "./edit/operations.js";
+import { ingestOne } from "./ingest/pipeline.js";
+import { recall } from "./recall/router.js";
+import { ensureHnswIndex, migrate } from "./storage/migrate.js";
+import { getPool } from "./storage/pool.js";
+const SEARCH_PARAMS = {
+    type: "object",
+    additionalProperties: false,
+    required: ["query"],
+    properties: {
+        query: { type: "string", description: "What you want to remember about." },
+        limit: {
+            type: "number",
+            minimum: 1,
+            maximum: 20,
+            description: "Max results to return (default 5).",
+        },
+        cwd: {
+            type: "string",
+            description: "Optional cwd anchor; e.g. the user's project root. When set, anchor route fires first.",
+        },
+        branch: { type: "string", description: "Optional git branch anchor." },
+        pr: { type: "string", description: "Optional PR number anchor." },
+        timeBucket: {
+            type: "string",
+            pattern: "^\\d{4}-\\d{2}-\\d{2}$",
+            description: "Optional ISO date YYYY-MM-DD to filter by.",
+        },
+        viewerUserId: {
+            type: "string",
+            description: "Advanced. The human asking. In multi-user groups, set this to scope recall to chunks visible to that specific user (per-user-global facts + group-public facts). Auto-derived from session key for DMs.",
+        },
+        viewerChatId: {
+            type: "string",
+            description: "Advanced. The chat the question was asked in (telegram chat id). Used together with viewerUserId for group privacy filtering. Omit for DM.",
+        },
+    },
+};
+const STORE_PARAMS = {
+    type: "object",
+    additionalProperties: false,
+    required: ["text"],
+    properties: {
+        text: {
+            type: "string",
+            minLength: 8,
+            description: "Information to remember. Concrete facts, decisions, or preferences work best.",
+        },
+        importance: {
+            type: "number",
+            minimum: 0,
+            maximum: 1,
+            description: "Importance 0-1 (default 0.5). Use 1.0 for pinned facts.",
+        },
+        pinned: {
+            type: "boolean",
+            description: "If true, mark as retention_class='pinned' so it never decays.",
+        },
+        cwd: { type: "string", description: "Optional cwd anchor." },
+        branch: { type: "string", description: "Optional branch anchor." },
+        pr: { type: "string", description: "Optional PR number anchor." },
+        file: { type: "string", description: "Optional file path anchor." },
+    },
+};
+/**
+ * Best-effort viewer extraction from session keys.
+ *
+ *   agent:<aid>:telegram:direct:<userId>       → DM, viewer = userId
+ *   agent:<aid>:telegram:group:<chatId>        → group, viewer.chatId only
+ *   agent:<aid>:telegram:group:<chat>:topic:<t> → forum, chatId only
+ *   agent:<aid>:main                            → legacy, no viewer
+ *
+ * Returns undefined fields when the session key doesn't encode them. The
+ * caller (memory_search tool body) merges explicit params on top of these
+ * inferences so Moderator-style callers can override.
+ */
+function viewerFromSessionKey(sessionKey) {
+    if (!sessionKey) {
+        return {};
+    }
+    // DM: agent:<aid>:<channel>:direct:<userId>
+    const dm = /^agent:[^:]+:[^:]+:direct:([^:]+)/.exec(sessionKey);
+    if (dm) {
+        return { userId: dm[1] };
+    }
+    // Group: agent:<aid>:<channel>:group:<chatId>(:topic:<t>)?
+    const grp = /^agent:[^:]+:[^:]+:group:([^:]+)/.exec(sessionKey);
+    if (grp) {
+        return { chatId: grp[1] };
+    }
+    return {};
+}
+const UPDATE_PARAMS = {
+    type: "object",
+    additionalProperties: false,
+    required: ["chunkId"],
+    properties: {
+        chunkId: { type: "string", description: "ID of the chunk to update (from prior memory_search result)." },
+        text: { type: "string", minLength: 1, description: "Replacement text. When set, the chunk is re-embedded." },
+        importance: { type: "number", minimum: 0, maximum: 1, description: "Override importance (0..1)." },
+        pinned: { type: "boolean", description: "When true → retention_class='pinned' (never decays). When false → 'standard'." },
+        reason: { type: "string", description: "Why you're updating this — recorded in the audit row." },
+    },
+};
+const FORGET_PARAMS = {
+    type: "object",
+    additionalProperties: false,
+    required: ["chunkId"],
+    properties: {
+        chunkId: { type: "string", description: "ID of the chunk to forget (from prior memory_search result)." },
+        hardDelete: { type: "boolean", description: "When true, fully delete (breaks cold-gist back-references). When false (default), soft-trash so it stops appearing in recall but can be audited." },
+        reason: { type: "string", description: "Why you're forgetting this — recorded in the audit row." },
+    },
+};
+/**
+ * Expected sessionKey shape: `agent:<agentId>:<sessionId>` (or longer with
+ * trailing colons for channel-scoped keys). Pull out `<agentId>` so
+ * memory_search / memory_store called from the `club` agent can never see
+ * the `main` agent's chunks (and vice versa).
+ *
+ * Fail-closed: if the sessionKey is present but does NOT match the expected
+ * shape, throw. Silently falling back to "main" was the original behavior,
+ * but it means a future openclaw release that changes session-key formatting
+ * could collapse multiple agents' memory namespaces into a single "main"
+ * pool without anyone noticing — a privacy/isolation regression that's hard
+ * to debug after the fact.
+ *
+ * An ABSENT sessionKey (undefined) still resolves to "main" because some
+ * callers (manual ingest scripts, doctor probes) legitimately have no
+ * session and the historical behavior treats those as the default agent.
+ */
+export function agentIdFromSessionKey(sessionKey) {
+    if (sessionKey === undefined || sessionKey === "") {
+        return "main";
+    }
+    const m = /^agent:([^:]+):/.exec(sessionKey);
+    if (!m) {
+        throw new Error(`[memory-postgres] unrecognised sessionKey shape: ${JSON.stringify(sessionKey)} ` +
+            `(expected 'agent:<agentId>:<sessionId>'). Refusing to fall back to ` +
+            `'main' to avoid silent cross-agent memory leakage.`);
+    }
+    return m[1];
+}
+function pluginConfigOf(cfg) {
+    const entry = cfg.plugins?.entries?.["memory-postgres"]?.config;
+    if (!entry) {
+        throw new Error("memory-postgres: plugin config missing");
+    }
+    validateConfig(entry);
+    return entry;
+}
+async function setup(config) {
+    const raw = config;
+    const cfg = resolveConfig(raw);
+    const pool = await getPool({
+        url: cfg.postgres.url,
+        poolMax: cfg.postgres.poolMax,
+        statementTimeoutMs: cfg.postgres.statementTimeoutMs,
+    });
+    // First-time call brings up the schema; subsequent calls are idempotent.
+    await migrate(pool);
+    // Surface HNSW build failures (see index.ts service start for rationale).
+    await ensureHnswIndex(pool).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.warn(`[memory-postgres] HNSW index not built (T2 hybrid degrades to seq scan): ${err.message}`);
+    });
+    const embedding = buildEmbeddingClientFromConfig({
+        baseUrl: cfg.embedding.baseUrl,
+        model: cfg.embedding.model,
+        apiKeyEnv: cfg.embedding.apiKeyEnv,
+        format: cfg.embedding.format,
+        path: cfg.embedding.path,
+    });
+    return { cfg, pool, embedding };
+}
+/**
+ * Returns the static descriptors used by `api.registerTool` factories.
+ * The actual `execute` body resolves config + pool lazily so each call sees
+ * the current runtime config.
+ */
+export function buildSearchTool(args) {
+    // Hand-rolled JSON schema is a structural superset of TSchema at runtime;
+    // the Plugin SDK's AnyAgentTool type insists on TSchema for design-time
+    // ergonomics, so we cast through unknown at the boundary.
+    const tool = {
+        name: "memory_search",
+        label: "Memory Search",
+        description: "Search long-term memory (Postgres + pgvector). Use to recall facts, preferences, "
+            + "past events, files / projects / people the user has mentioned. "
+            + "Pass `cwd`/`branch`/`pr`/`timeBucket` when you have anchor signals so the call stays sub-second and free.",
+        parameters: SEARCH_PARAMS,
+        async execute(_toolCallId, params) {
+            const p = params;
+            const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+            // Viewer inference: start from session key, let explicit params override.
+            const inferredViewer = viewerFromSessionKey(args.sessionKey);
+            const viewer = {
+                userId: p.viewerUserId ?? inferredViewer.userId,
+                chatId: p.viewerChatId ?? inferredViewer.chatId,
+            };
+            const result = await recall({ cfg, pool, embedding }, {
+                query: p.query,
+                maxResults: p.limit ?? 5,
+                anchors: {
+                    cwd: p.cwd,
+                    branch: p.branch,
+                    pr: p.pr,
+                },
+                timeBucket: p.timeBucket,
+                agentSessionId: args.sessionKey,
+                agentId: agentIdFromSessionKey(args.sessionKey),
+                // Only attach viewer when we actually have something to filter on;
+                // an empty viewer object signals "no filtering" to the router.
+                viewer: viewer.userId || viewer.chatId ? viewer : undefined,
+            });
+            if (result.results.length === 0) {
+                return {
+                    content: [{ type: "text", text: "No relevant memories found." }],
+                    details: {
+                        count: 0,
+                        hitTier: result.hitTier,
+                        embedCalls: result.embedCalls,
+                        latencyMs: result.latencyMs,
+                    },
+                };
+            }
+            const lines = result.results.map((c, i) => {
+                const tier = c.hits.join("+");
+                return `${i + 1}. [${tier}] ${c.text.slice(0, 220)}`;
+            });
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Found ${result.results.length} memory snippet(s):\n${lines.join("\n")}`,
+                    },
+                ],
+                details: {
+                    count: result.results.length,
+                    hitTier: result.hitTier,
+                    score: result.score,
+                    embedCalls: result.embedCalls,
+                    llmTokensUsed: result.llmTokensUsed,
+                    latencyMs: result.latencyMs,
+                    routesRun: result.routesRun,
+                    zeroCostHit: result.zeroCostHit,
+                    results: result.results.map((c) => ({
+                        chunkId: c.chunkId,
+                        source: c.source,
+                        text: c.text,
+                        score: c.combinedScore,
+                        hits: c.hits,
+                    })),
+                },
+            };
+        },
+    };
+    return tool;
+}
+export function buildUpdateTool(args) {
+    const tool = {
+        name: "memory_update",
+        label: "Memory Update",
+        description: "Rewrite or re-classify a chunk you previously stored. Use when you "
+            + "learn the fact has changed (Yao's preferred language switched), when "
+            + "you want to pin something important (importance=1.0 + pinned=true), or "
+            + "when an earlier write was incorrect. Pass the chunkId from a recent "
+            + "memory_search result. Per-agent isolation enforced.",
+        parameters: UPDATE_PARAMS,
+        async execute(_toolCallId, params) {
+            const p = params;
+            const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+            const agentId = agentIdFromSessionKey(args.sessionKey);
+            const outcome = await updateChunk({ cfg, pool, embedding }, {
+                chunkId: p.chunkId,
+                agentId,
+                text: p.text,
+                importance: p.importance ?? (p.pinned === true ? 1.0 : undefined),
+                retentionClass: p.pinned === true ? "pinned" : p.pinned === false ? "standard" : undefined,
+                reason: p.reason,
+            });
+            if (!outcome.ok) {
+                return {
+                    content: [{ type: "text", text: `Update failed: ${outcome.reason}.` }],
+                    details: { decision: "rejected", reason: outcome.reason },
+                };
+            }
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Updated chunk ${outcome.chunkId}${outcome.reEmbedded ? " (re-embedded)" : ""}.`,
+                    },
+                ],
+                details: { decision: "updated", chunkId: outcome.chunkId, reEmbedded: outcome.reEmbedded },
+            };
+        },
+    };
+    return tool;
+}
+export function buildForgetTool(args) {
+    const tool = {
+        name: "memory_forget",
+        label: "Memory Forget",
+        description: "Mark a chunk as trash so it stops appearing in recall. Use for "
+            + "outdated facts, mistaken writes, or anything the user explicitly "
+            + "asks you to forget. Default is soft (retention_class='trash') — "
+            + "the chunk still exists for audit but won't surface. Pass "
+            + "hardDelete=true only if the user asks for true deletion. "
+            + "Per-agent isolation enforced.",
+        parameters: FORGET_PARAMS,
+        async execute(_toolCallId, params) {
+            const p = params;
+            const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+            const agentId = agentIdFromSessionKey(args.sessionKey);
+            const outcome = await forgetChunk({ cfg, pool, embedding }, {
+                chunkId: p.chunkId,
+                agentId,
+                hardDelete: p.hardDelete === true,
+                reason: p.reason,
+            });
+            if (!outcome.ok) {
+                return {
+                    content: [{ type: "text", text: `Forget failed: ${outcome.reason}.` }],
+                    details: { decision: "rejected", reason: outcome.reason },
+                };
+            }
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Forgot chunk ${outcome.chunkId} (mode=${outcome.mode}).`,
+                    },
+                ],
+                details: {
+                    decision: outcome.mode === "tombstone" ? "tombstoned" : "trashed",
+                    chunkId: outcome.chunkId,
+                    mode: outcome.mode,
+                    deletedRow: outcome.deletedRow,
+                },
+            };
+        },
+    };
+    return tool;
+}
+export function buildStoreTool(args) {
+    const tool = {
+        name: "memory_store",
+        label: "Memory Store",
+        description: "Write a fact / preference / decision to long-term memory. Use sparingly: only "
+            + "for things genuinely worth remembering across sessions (preferences, project facts, decisions). "
+            + "Pass `cwd`/`branch`/`pr`/`file` anchors when relevant so future recall can find it instantly.",
+        parameters: STORE_PARAMS,
+        async execute(_toolCallId, params) {
+            const p = params;
+            const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+            const outcome = await ingestOne({ cfg, pool, embedding }, {
+                text: p.text,
+                source: "manual",
+                kind: "fact",
+                agentSessionId: args.sessionKey,
+                agentId: agentIdFromSessionKey(args.sessionKey),
+                importance: p.importance ?? (p.pinned ? 1.0 : 0.5),
+                retentionClass: p.pinned ? "pinned" : "standard",
+                anchors: {
+                    cwd: p.cwd,
+                    branch: p.branch,
+                    pr: p.pr,
+                    file: p.file,
+                },
+            });
+            const summary = outcome.decision === "accepted"
+                ? `Stored. id=${outcome.chunkId}, path=${outcome.ingestPath}, score=${outcome.score.toFixed(1)}.`
+                : outcome.decision === "merged"
+                    ? `Already known (merged with existing chunk ${outcome.chunkId}). No new write.`
+                    : `Did not store: ${outcome.decision}${outcome.rejectReason ? ` (${outcome.rejectReason})` : ""}.`;
+            return {
+                content: [{ type: "text", text: summary }],
+                details: {
+                    decision: outcome.decision,
+                    rejectReason: outcome.rejectReason,
+                    chunkId: outcome.chunkId,
+                    ingestPath: outcome.ingestPath,
+                    routes: outcome.routes,
+                    score: outcome.score,
+                    llmTokensUsed: outcome.llmTokensUsed,
+                    latencyMs: outcome.latencyMs,
+                },
+            };
+        },
+    };
+    return tool;
+}
