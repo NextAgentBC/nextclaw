@@ -1,5 +1,106 @@
 # Changelog
 
+## 0.2.1 — Curl-first install + distribution fixes
+
+0.2.1 is a packaging / install-UX release. No new runtime features — the focus
+is letting a non-developer install the plugin against a curl-installed OpenClaw
+in under 10 minutes, on a machine with neither pnpm nor a source checkout.
+
+### Distributable via `openclaw plugins install git:` / `npm:`
+
+- `package.json` `openclaw.extensions` now points at `./dist/index.js`. The
+  previous `./index.ts` value only worked for local-development checkouts —
+  OpenClaw's plugin installer requires a compiled entry for any non-`--link`
+  install source. Verified live: `openclaw plugins install
+  git:github.com/NextAgentBC/nextclaw` against a curl-installed OpenClaw now
+  succeeds end-to-end, registers `memory-postgres` as an enabled plugin, and
+  surfaces the dashboard at `127.0.0.1:8765` after `openclaw gateway restart`.
+- `dist/` (752 KB, 75 files) is now tracked in git. OpenClaw's installer runs
+  `npm install --omit=dev --omit=peer`, which strips the typescript compiler,
+  so any `prepare`-time rebuild is impossible during a normal install. The
+  in-tree dist is the source of truth. Contributors must `npm run build` and
+  `git add dist/` before merging source changes — a comment at the top of
+  `.gitignore` calls this out.
+- New `scripts/prepare-build.mjs`. Invoked from the `prepare` script. When
+  typescript is resolvable (regular dev checkouts) it rebuilds; otherwise it
+  cleanly skips and prints a one-line note. Either way the install succeeds
+  with a usable `dist/`.
+- `openclaw.plugin.json` had two `"activation"` keys at the top of the
+  manifest. The second one shadowed the first, forcing `onStartup: false`.
+  Now deduped → plugin activates on gateway startup as intended.
+
+### Documentation rewritten around curl-installed OpenClaw
+
+- `README.md` Quick Start replaced. Old flow was clone OpenClaw → `pnpm
+  install && pnpm build` → drop nextclaw into `extensions/` → `pnpm openclaw
+  gateway start`. New flow is:
+  ```bash
+  curl -fsSL https://openclaw.ai/install.sh | bash
+  openclaw onboard --install-daemon
+  # ... pick Postgres (Neon or Docker)
+  openclaw plugins install git:github.com/NextAgentBC/nextclaw
+  curl -fsSL .../scripts/configure-minimal.mjs | PG_URL=... node --input-type=module
+  openclaw gateway restart
+  ```
+- Postgres step now offers **Neon (zero local deps, free tier)** as Option A
+  alongside a single-`docker run` Option B. Neither requires cloning this repo
+  to get a `docker-compose.yml`.
+- New helper `scripts/configure-minimal.mjs`. Pipes through `curl | node`. Reads
+  the existing `~/.openclaw/openclaw.json` (created by `openclaw onboard`),
+  injects only `plugins.slots.memory` and `plugins.entries["memory-postgres"]`,
+  writes back. Round-trip tested against a real onboard-produced config: every
+  non-`plugins` key (gateway, agents, auth, channels, …) is byte-identical
+  before/after. Masks the Postgres password in its stdout output.
+- New "Other install methods" section in README enumerates git / npm /
+  ClawHub / local-dev install sources. Notes that the bare `nextclaw` npm
+  name is taken by an unrelated CLI, so any future npm publish will be
+  scoped (e.g. `@nextagentbc/nextclaw`).
+- `docs/INSTALL.md` steps ①②④⑤⑦ rewritten to match. Discord, multi-agent
+  isolation, reflection, Telegram Moderator, and web_search bolt-on sections
+  preserved verbatim.
+- `docs/SERVICES.md` §1 (Postgres) gains the Neon / Docker side-by-side; §7
+  (OpenClaw) drops the source-checkout + pnpm instructions.
+
+### Documentation bug fixes surfaced by end-to-end dogfood
+
+Two long-standing doc bugs only became visible after dogfooding the new flow
+end-to-end on a clean machine.
+
+- **Dashboard auth header.** The HTTP dashboard validates requests via the
+  `X-Token` header (or `?token=` query param). Pre-0.2.1 README/INSTALL
+  examples used `Authorization: Bearer $TOKEN`, which the dashboard treats
+  as no token at all and returns 401. All `curl` examples (`/api/ingest`,
+  `/api/recall`, `/api/reflection/run-now`) switched to `X-Token`. The
+  dashboard JS itself was already using `X-Token` after capturing `?token=`
+  into `sessionStorage`, so this was a docs-only fix.
+- **Daemon env path.** `openclaw onboard --install-daemon` runs the gateway
+  via launchd on macOS and systemd-user on Linux. Neither reads `~/.zshrc`
+  or `~/.bashrc`. The daemon sources `~/.openclaw/service-env/ai.openclaw.gateway.env`
+  on every start. Pre-0.2.1 docs told users to `echo "export
+  NEXTCLAW_DASH_TOKEN=…" >> ~/.zshrc`, which left the daemon with an empty
+  token (dashboard rejected every request) and no `JINA_API_KEY` (embedding
+  client got `AUTH_MISSING_API_KEY` from Jina). README step 3 and step 6 +
+  INSTALL.md step ⑦ now write to the service-env file and keep the
+  shell-rc append only for the smoke-test curls.
+
+### Validated end-to-end on a clean machine
+
+Full dogfood ran on macOS with no pnpm, no docker, no Node project. Steps
+executed exactly as the new docs ship them: `brew install colima docker` →
+`colima start` → single `docker run pgvector/pgvector:pg16` + three
+`CREATE EXTENSION` → `openclaw plugins install git:…` → `configure-minimal.mjs` →
+`openclaw gateway restart`. The smoke test then exercises all four recall
+behaviours:
+
+- Lexical hit on a keyword-overlapping query → `hitTier=t1, embedCalls=0, latencyMs=2`
+- Semantically equivalent English query with no lexical overlap → `hitTier=t2_hybrid, embedCalls=1, latencyMs=379`
+- Chinese cross-language query → `hitTier=t2_hybrid, embedCalls=1, latencyMs=440, score=1.78`
+- Repeat of any prior query → `t1 cache, zeroCostHit=true, latencyMs=2`
+
+All four match what the README advertises.
+
+---
+
 ## 0.2.0 — Jina-default + active memory
 
 The 0.1.0 release was passive: chunks went in, chunks came out via 8
