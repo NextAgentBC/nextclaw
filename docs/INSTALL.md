@@ -336,16 +336,28 @@ EOF
 ## ⑦ Start, then verify with a smoke test
 
 ```bash
-# Generate a dashboard token (any random string) and persist it
+# Generate a dashboard token (any random string)
 export NEXTCLAW_DASH_TOKEN=$(openssl rand -hex 24)
-echo "export NEXTCLAW_DASH_TOKEN=$NEXTCLAW_DASH_TOKEN" >> ~/.zshrc   # or ~/.bashrc
+
+# Persist for the daemon (launchd/systemd does NOT read ~/.zshrc — it sources
+# ~/.openclaw/service-env/ai.openclaw.gateway.env on each start).
+# Same file should also hold JINA_API_KEY so the embedding client can run.
+ENV_FILE=~/.openclaw/service-env/ai.openclaw.gateway.env
+grep -q '^export JINA_API_KEY=' "$ENV_FILE" 2>/dev/null \
+  || echo "export JINA_API_KEY=$JINA_API_KEY" >> "$ENV_FILE"
+echo "export NEXTCLAW_DASH_TOKEN=$NEXTCLAW_DASH_TOKEN" >> "$ENV_FILE"
+
+# Persist for this shell too (for the smoke-test curls below)
+echo "export NEXTCLAW_DASH_TOKEN=$NEXTCLAW_DASH_TOKEN" >> ~/.zshrc
 
 # Restart the gateway daemon so it picks up the new plugin + config
 openclaw gateway restart
 ```
 
 On first start, the migration runner applies all DDL files bundled with
-the plugin (`~/.openclaw/extensions/memory-postgres/dist/src/storage/schema/*.sql`). Watch for:
+the plugin (under `<install-path>/dist/src/storage/schema/*.sql`; the
+exact install path varies — run `openclaw plugins list | grep memory-postgres`
+to see it). Watch for:
 
 ```
 memory-postgres: capability + tools registered (memory_search, memory_store, dashboard, ...)
@@ -355,17 +367,19 @@ http server listening
 
 ### Smoke test 1 — write + recall via the universal HTTP gateway
 
+The dashboard API authenticates via the **`X-Token`** header (or `?token=` query param). The browser dashboard captures `?token=…` into `sessionStorage` and forwards it as `X-Token` on every later request.
+
 ```bash
 # Write
 curl -sS -X POST http://127.0.0.1:8765/api/ingest \
-  -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN" \
+  -H "X-Token: $NEXTCLAW_DASH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"text":"My favorite Postgres extension is pgvector.","source":"smoke","agentId":"main"}' \
   | python3 -m json.tool
 
 # Recall
 curl -sS -X POST http://127.0.0.1:8765/api/recall \
-  -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN" \
+  -H "X-Token: $NEXTCLAW_DASH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"query":"What is my favorite Postgres extension?","agentId":"main"}' \
   | python3 -m json.tool
@@ -549,7 +563,7 @@ The first reflection runs ~24h after startup. To force one early, manually call 
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8765/api/reflection/run-now" \
-  -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN"
+  -H "X-Token: $NEXTCLAW_DASH_TOKEN"
 ```
 
 ---

@@ -114,13 +114,17 @@ export PG_URL="postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw"
 export JINA_API_KEY=jina_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Persist `PG_URL` and `JINA_API_KEY` so future shells still have them:
+Persist `PG_URL` for future shells, and `JINA_API_KEY` for both shells *and* the OpenClaw daemon. The daemon is launched by launchd/systemd, so it does **not** read your `~/.zshrc` — it reads `~/.openclaw/service-env/ai.openclaw.gateway.env`:
 
 ```bash
+# For interactive shells (future `configure-minimal.mjs` runs, ad-hoc psql, etc.)
 cat >> ~/.zshrc <<EOF   # or ~/.bashrc
 export PG_URL="$PG_URL"
 export JINA_API_KEY=$JINA_API_KEY
 EOF
+
+# For the gateway daemon (so memory_search / memory_store can call Jina)
+echo "export JINA_API_KEY=$JINA_API_KEY" >> ~/.openclaw/service-env/ai.openclaw.gateway.env
 ```
 
 ### Step 4 — Install nextclaw into OpenClaw
@@ -159,23 +163,35 @@ This adds two keys to `~/.openclaw/openclaw.json` and leaves everything else (`g
 
 ```bash
 export NEXTCLAW_DASH_TOKEN=$(openssl rand -hex 24)
+# Persist for the daemon (same env file as JINA_API_KEY above)
+echo "export NEXTCLAW_DASH_TOKEN=$NEXTCLAW_DASH_TOKEN" >> ~/.openclaw/service-env/ai.openclaw.gateway.env
+# Persist for this shell session too, for the smoke-test curls below
 echo "export NEXTCLAW_DASH_TOKEN=$NEXTCLAW_DASH_TOKEN" >> ~/.zshrc
+
 openclaw gateway restart
 ```
 
 ### Step 7 — Smoke test: write a memory, then recall it
 
+The dashboard's HTTP API authenticates via the **`X-Token`** header (or `?token=` query param) — not `Authorization: Bearer`. The browser dashboard captures `?token=…` into `sessionStorage` and then forwards it as `X-Token` on every subsequent call.
+
 ```bash
 curl -sS -X POST http://127.0.0.1:8765/api/ingest \
-  -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN" \
+  -H "X-Token: $NEXTCLAW_DASH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"text":"My favorite Postgres extension is pgvector.","source":"smoke","agentId":"main"}'
 
 curl -sS -X POST http://127.0.0.1:8765/api/recall \
-  -H "Authorization: Bearer $NEXTCLAW_DASH_TOKEN" \
+  -H "X-Token: $NEXTCLAW_DASH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"query":"What is my favorite Postgres extension?","agentId":"main"}'
 # → returns the chunk with hitTier: "t2_hybrid"
+```
+
+To open the live dashboard in your browser:
+
+```
+http://127.0.0.1:8765/?token=$NEXTCLAW_DASH_TOKEN
 ```
 
 For the **full 0 → 1 walkthrough** with persona files, troubleshooting, Discord/Telegram bots, web_search, and multi-agent isolation, see **[docs/INSTALL.md](docs/INSTALL.md)**.
