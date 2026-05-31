@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.1 — Opt-in memory sidecar (stop the `<mem>` leak)
+
+Patch release on top of 0.3.0. One behavior change, no migrations.
+
+### Fixed
+
+- **The `## Memory Sidecar` prompt block is now opt-in (`sidecar.enabled`,
+  default `false`).** That block asks the agent to append a `<mem>{...}</mem>`
+  line at the end of every turn. On backends whose reply delivery bypasses
+  OpenClaw's `message_sending` hook — notably the **claude-cli backend** — the
+  block is not stripped and leaked verbatim into user-facing replies
+  (Telegram/Discord), with no way to remove it downstream. Until now it was
+  emitted unconditionally on every install. It is now gated behind the
+  (previously inert) `sidecar.enabled` flag and defaults OFF, so no deployment
+  leaks `<mem>` out of the box.
+
+  Memory capture is unaffected when the sidecar is off: `memory_store` and the
+  transcript watcher still ingest every turn — the sidecar was only the
+  cheapest of several capture paths. Re-enable it with
+  `sidecar: { enabled: true }` in your `memory-postgres` plugin config once
+  you've confirmed your backend strips the block before the user sees it. The
+  flag is read once at plugin register time, so a `openclaw gateway restart`
+  picks up a change.
+
+- Bumped `package-lock.json` to match (0.3.0 shipped with a stale `0.2.1`
+  version stamp in the lockfile).
+
 ## 0.3.0 — Curated recall + action-sensitive memory
 
 Memory-quality release on top of 0.2.1 (merged via #21, 2026-05-31). Two

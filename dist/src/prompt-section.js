@@ -1,13 +1,21 @@
 /**
  * memory-postgres prompt section: tells the agent how to use memory_search /
- * memory_store, and asks it to emit a sidecar JSON block at turn end so we
- * can capture facts/preferences/metrics structurally.
+ * memory_store, and (opt-in) asks it to emit a sidecar JSON block at turn end
+ * so we can capture facts/preferences/metrics structurally.
  *
  * Returns lines that get appended to the agent's system prompt. The shape
  * matches memory-core's prompt section so the agent's prompt structure
  * stays consistent across memory backends.
+ *
+ * The sidecar block is gated behind `sidecar.enabled` (default OFF) — see
+ * {@link PromptSectionOptions.emitSidecar} for why.
  */
-export const buildPromptSection = ({ availableTools, citationsMode, }) => {
+/**
+ * Build the memory prompt-section builder. `opts.emitSidecar` gates the
+ * sidecar instruction (see {@link PromptSectionOptions}); everything else is
+ * always emitted when the corresponding tool is available.
+ */
+export const makeBuildPromptSection = (opts) => ({ availableTools, citationsMode }) => {
     const hasSearch = availableTools.has("memory_search");
     const hasStore = availableTools.has("memory_store");
     const hasUpdate = availableTools.has("memory_update");
@@ -49,9 +57,16 @@ export const buildPromptSection = ({ availableTools, citationsMode, }) => {
     // Sidecar tagging: ask the agent to emit a structured JSON block at turn end.
     // The flushPlanResolver / dream pipeline scans for this and ingests it via
     // ingestOne's sidecarText path — zero LLM cost for the structuring pass.
-    lines.push("## Memory Sidecar", "After your reply, on the very last line of your turn output exactly one structured "
-        + "block in this format (omit if nothing memorable happened):", "<mem>{\"entities\":[],\"events\":[],\"preferences\":[],\"metrics\":[]}</mem>", "Each item is small and concrete (e.g. {\"type\":\"person\",\"canonicalName\":\"shadow\"}, "
-        + "{\"metric\":\"calories\",\"value\":1800,\"unit\":\"kcal\",\"ts\":\"2026-05-02\"}).", "Sidecar is the cheapest path; deterministic regex + tool calls back you up if you skip it.");
+    //
+    // OFF by default (opt-in via `sidecar.enabled: true`): on backends that
+    // bypass the `message_sending` hook (e.g. the claude-cli backend) this block
+    // leaks verbatim into user-facing replies and cannot be stripped downstream.
+    // Capture is unaffected when it's off — see PromptSectionOptions.emitSidecar.
+    if (opts.emitSidecar) {
+        lines.push("## Memory Sidecar", "After your reply, on the very last line of your turn output exactly one structured "
+            + "block in this format (omit if nothing memorable happened):", "<mem>{\"entities\":[],\"events\":[],\"preferences\":[],\"metrics\":[]}</mem>", "Each item is small and concrete (e.g. {\"type\":\"person\",\"canonicalName\":\"shadow\"}, "
+            + "{\"metric\":\"calories\",\"value\":1800,\"unit\":\"kcal\",\"ts\":\"2026-05-02\"}).", "Sidecar is the cheapest path; deterministic regex + tool calls back you up if you skip it.");
+    }
     if (citationsMode === "off") {
         lines.push("Citations are disabled: do not include source paths or line numbers in replies unless the user explicitly asks.");
     }

@@ -21,7 +21,7 @@ import { memoryRuntime } from "./manager-runtime.js";
 import { resolveConfig, validateConfig } from "./src/config.js";
 import { buildEmbeddingClientFromConfig } from "./src/embedding/client.js";
 import { startDashboardServer, type DashboardServer } from "./src/dashboard/server.js";
-import { buildPromptSection } from "./src/prompt-section.js";
+import { makeBuildPromptSection } from "./src/prompt-section.js";
 import { migrate, ensureHnswIndex } from "./src/storage/migrate.js";
 import { closePool, getPool, type ResolvedPoolConfig } from "./src/storage/pool.js";
 import {
@@ -139,9 +139,21 @@ export default definePluginEntry({
   kind: "memory",
 
   register(api) {
+    // Sidecar prompt is opt-in via `sidecar.enabled` (default OFF). On backends
+    // that bypass the `message_sending` hook (e.g. the claude-cli backend) the
+    // emitted <mem>{...} block leaks verbatim into user-facing replies, so we
+    // don't ask the agent for it unless explicitly enabled. Capture is
+    // unaffected (memory_store + transcript watcher). Snapshot at register
+    // time — a gateway restart re-reads config.
+    const emitSidecar =
+      (api.pluginConfig as { sidecar?: { enabled?: boolean } } | undefined)
+        ?.sidecar?.enabled === true;
+    api.logger.info(
+      `memory-postgres: sidecar prompt ${emitSidecar ? "enabled" : "disabled (default; set sidecar.enabled:true to opt in)"}`,
+    );
     api.registerMemoryCapability({
       runtime: memoryRuntime,
-      promptBuilder: buildPromptSection,
+      promptBuilder: makeBuildPromptSection({ emitSidecar }),
     });
 
     api.registerTool(

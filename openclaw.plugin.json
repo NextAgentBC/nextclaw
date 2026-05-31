@@ -193,7 +193,8 @@
         "additionalProperties": false,
         "properties": {
           "enabled": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Append the '## Memory Sidecar' prompt block (asks the agent to emit a <mem>{...}</mem> line each turn). Default false (opt-in). Keep OFF on backends whose reply delivery bypasses the message_sending hook (e.g. the claude-cli backend) — there the block leaks verbatim into user-facing replies and cannot be stripped. Memory capture is unaffected: memory_store + the transcript watcher still ingest every turn."
           },
           "triggers": {
             "type": "object",
