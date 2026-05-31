@@ -223,7 +223,10 @@ export async function ingestOne(deps, input) {
     const dup = await deps.pool.query("SELECT id FROM semantic.chunks WHERE text_hash = $1 AND source = $2", [textHash, source]);
     if (dup.rowCount && dup.rowCount > 0) {
         const id = dup.rows[0].id;
-        await deps.pool.query("UPDATE semantic.chunks SET last_recalled_at = now() WHERE id = $1", [id]);
+        // Re-ingest (dedup), not a recall — bump last_seen_at / dup_count only.
+        // last_recalled_at stays reserved for genuine recall hits so the cold
+        // compactor can still age these chunks. See storage/schema/60-last-seen.sql.
+        await deps.pool.query("UPDATE semantic.chunks SET last_seen_at = now(), dup_count = dup_count + 1 WHERE id = $1", [id]);
         return finalize(deps, source, text, earlyAgentId, dreamRunId, start, {
             decision: "merged",
             ingestPath: path,
@@ -287,6 +290,7 @@ export async function ingestOne(deps, input) {
         rawExcerpt: text,
         result: extractor,
         dreamRunId,
+        agentId,
     });
     await writeEntityRefIndexes(deps.pool, chunkId, reconcileOut.entityIds);
     if (reconcileOut.entityIds.length > 0) {

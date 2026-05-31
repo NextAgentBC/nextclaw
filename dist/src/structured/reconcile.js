@@ -24,6 +24,7 @@ export async function reconcile(pool, input) {
             eventIds: [],
             preferenceIds: [],
             metricIds: [],
+            commitmentIds: [],
             dedupCount: 0,
         };
         // 1. Entities first — relations/events refer to entity ids.
@@ -83,6 +84,14 @@ export async function reconcile(pool, input) {
                 out.dedupCount += 1;
             }
             out.metricIds.push(id);
+        }
+        const agentId = input.agentId ?? "main";
+        for (const c of input.result.commitments) {
+            const { id, deduped } = await upsertCommitment(client, c, agentId, input.chunkId);
+            if (deduped) {
+                out.dedupCount += 1;
+            }
+            out.commitmentIds.push(id);
         }
         // Provenance — one row per *new* structured insertion (skip dedups).
         await writeProvenance(client, input, out);
@@ -221,6 +230,27 @@ async function upsertMetric(client, m) {
      VALUES ($1, $2, $3, $4, $5, $6, $7)`, [id, m.ts, m.metric, m.value, m.unit ?? null, m.dim ?? {}, m.confidence]);
     return { id, deduped: false };
 }
+/* ------------------------------- commitments ------------------------------- */
+async function upsertCommitment(client, c, agentId, chunkId) {
+    // Dedup an identical active directive for the same agent (e.g. the same rule
+    // re-stated). The supersede chain (invalidated_at + supersedes) is left for a
+    // later pass; v1 just avoids exact-duplicate rows.
+    const existing = await client.query(`SELECT id FROM structured.commitments
+       WHERE agent_id = $1 AND kind = $2 AND directive = $3 AND invalidated_at IS NULL
+       LIMIT 1`, [agentId, c.kind, c.directive]);
+    if (existing.rowCount && existing.rowCount > 0) {
+        return { id: existing.rows[0].id, deduped: true };
+    }
+    const id = randomUUID();
+    await client.query(`INSERT INTO structured.commitments
+       (id, agent_id, chunk_id, directive, kind, safe_to_act, requires_confirmation,
+        authority, valid_from, expires_at, confidence)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, [
+        id, agentId, chunkId, c.directive, c.kind, c.safeToAct, c.requiresConfirmation,
+        c.authority ?? null, c.validFrom ?? null, c.expiresAt ?? null, c.confidence,
+    ]);
+    return { id, deduped: false };
+}
 /* ------------------------------- provenance -------------------------------- */
 async function writeProvenance(client, input, out) {
     const rows = [];
@@ -238,6 +268,9 @@ async function writeProvenance(client, input, out) {
     }
     for (const id of out.metricIds) {
         rows.push(["metric", id, "metrics"]);
+    }
+    for (const id of out.commitmentIds) {
+        rows.push(["commitment", id, "commitments"]);
     }
     if (rows.length === 0) {
         return;

@@ -125,3 +125,36 @@ export async function forgetChunk(deps, params) {
         .catch(() => undefined);
     return { ok: true, chunkId: params.chunkId, mode, deletedRow: params.hardDelete === true };
 }
+/**
+ * Fetch one chunk in full by id. Read-only — does NOT bump warmth / recall_count
+ * (the agent already holds the id from a prior recall; treating a targeted
+ * re-read as a recall would re-pollute the cold-aging signal — see
+ * 60-last-seen.sql). Fail-closed isolation: the id + agent_id filter is in the
+ * WHERE, so a chunk owned by another agent reads as not-found (we don't even
+ * reveal it exists).
+ */
+export async function getChunk(deps, params) {
+    const rows = await deps.pool.query(`SELECT id, text, source, source_ref, kind, retention_class,
+            importance, recall_count, created_at
+       FROM semantic.chunks
+      WHERE id = $1 AND agent_id = $2`, [params.chunkId, params.agentId]);
+    if (rows.rowCount === 0) {
+        return { ok: false, reason: "not-found" };
+    }
+    const r = rows.rows[0];
+    return {
+        ok: true,
+        chunk: {
+            chunkId: r.id,
+            text: r.text,
+            source: r.source,
+            sourceRef: r.source_ref,
+            kind: r.kind,
+            retentionClass: r.retention_class,
+            importance: r.importance,
+            recallCount: r.recall_count,
+            createdAt: r.created_at.toISOString(),
+            citation: `pg://${r.source}/${r.id}`,
+        },
+    };
+}

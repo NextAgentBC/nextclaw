@@ -194,8 +194,13 @@ export async function writeChunk(
     [textHash, input.source],
   );
   if (dup.rowCount && dup.rowCount > 0) {
+    // Dedup hit: this is a re-ingest, not a recall. Bump last_seen_at / dup_count
+    // and leave last_recalled_at + recall_count untouched — the cold-gist
+    // compactor ages chunks by last_recalled_at, so conflating the two would
+    // keep re-seen chunks perpetually "warm" and they'd never compact.
+    // See src/storage/schema/60-last-seen.sql.
     await pool.query(
-      "UPDATE semantic.chunks SET last_recalled_at = now() WHERE id = $1",
+      "UPDATE semantic.chunks SET last_seen_at = now(), dup_count = dup_count + 1 WHERE id = $1",
       [dup.rows[0].id],
     );
     return { id: dup.rows[0].id, written: false };

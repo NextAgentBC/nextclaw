@@ -13,5 +13,6 @@ export const emptyResult = (extractorVersion) => ({
     events: [],
     preferences: [],
     metrics: [],
+    commitments: [],
     extractorVersion,
 });

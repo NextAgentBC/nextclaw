@@ -23,7 +23,7 @@ import { startDashboardServer } from "./src/dashboard/server.js";
 import { buildPromptSection } from "./src/prompt-section.js";
 import { migrate, ensureHnswIndex } from "./src/storage/migrate.js";
 import { closePool, getPool } from "./src/storage/pool.js";
-import { buildForgetTool, buildSearchTool, buildStoreTool, buildUpdateTool, } from "./src/tools.js";
+import { buildForgetTool, buildGetTool, buildSearchTool, buildStoreTool, buildUpdateTool, } from "./src/tools.js";
 import { compactCold } from "./src/workers/compactor.js";
 import { startGitWatcherDaemon } from "./src/workers/git-watcher.js";
 import { buildReflectionClient, startReflectionDaemon, } from "./src/workers/reflection.js";
@@ -114,6 +114,13 @@ export default definePluginEntry({
             }
             return buildSearchTool({ config, sessionKey: ctx.sessionKey });
         }, { names: ["memory_search"] });
+        api.registerTool((ctx) => {
+            const config = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
+            if (!config) {
+                throw new Error("memory-postgres: no runtime config available in tool context");
+            }
+            return buildGetTool({ config, sessionKey: ctx.sessionKey });
+        }, { names: ["memory_get"] });
         api.registerTool((ctx) => {
             const config = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
             if (!config) {
@@ -688,7 +695,7 @@ export default definePluginEntry({
             },
         });
         api.logger.info("memory-postgres: capability + tools registered "
-            + "(memory_search, memory_store, memory_update, memory_forget; "
+            + "(memory_search, memory_get, memory_store, memory_update, memory_forget; "
             + "services: dashboard, tuning, compactor, reflection)");
     },
 });
