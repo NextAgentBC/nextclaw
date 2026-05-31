@@ -665,9 +665,6 @@
     }
   },
   "contracts": {
-    "memoryEmbeddingProviders": [
-      "openai-compat"
-    ],
     "tools": [
       "memory_search",
       "memory_get",

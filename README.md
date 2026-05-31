@@ -48,6 +48,8 @@
 - **Real-time dashboard** (bilingual CN/EN) with category breakdown, redaction for health/medical, bot-turn telemetry, side-by-side model comparison
 - **Self-tuning loop** (daily / weekly / monthly proposals)
 - **Universal HTTP ingest gateway** — any cron / skill / external script can write memory through the same Stage 0–6 pipeline
+- **Curated, cited recall**: `memory_search` results carry `pg://` citations so the agent can attribute a claim and re-fetch it in full via `memory_get(chunkId)`; `memory_update` / `memory_forget` let the agent actively curate rather than only append
+- **Action-sensitive memory**: directives the agent might *act* on (cancel, send, authorize, appointments) are tagged with `safe_to_act` / `requires_confirmation` / `authority` and surfaced with a ⚠ on recall — a stale or stray remark can't trigger a real-world action without a check
 
 ## Companion skills
 

@@ -13,6 +13,7 @@ Postgres + pgvector backed memory plugin for OpenClaw. Fills `plugins.slots.memo
 - Self-tuning loop (daily / weekly / monthly proposals)
 - Dashboard via PG LISTEN/NOTIFY
 - Hard per-agent memory namespace isolation (`agent_id` column threaded through every recall path)
+- Action-sensitive commitments: directives the agent might act on are tagged (`safe_to_act` / `requires_confirmation` / `authority` / validity) and surfaced with a ⚠ on recall, so a stray remark can't trigger an action
 
 ## Layout
 
@@ -24,7 +25,7 @@ Postgres + pgvector backed memory plugin for OpenClaw. Fills `plugins.slots.memo
 | `src/recall/` | Tier-walk + parallel route impls + intent + merge |
 | `src/workers/` | context-primer, spreading-activator, compactor, feedback, scoring, tuning, git-watcher, transcript-watcher, shadow-comparator |
 | `src/cache/` | CacheBackend abstraction + PG UNLOGGED impl |
-| `src/structured/` | entity / event / metric / preference extractors + reconcile + categorizer |
+| `src/structured/` | entity / event / metric / preference / commitment extractors + reconcile + categorizer (+ `commitments.ts` recall-side reader) |
 | `src/sdk/` | StructuredMemoryAPI public exports |
 | `src/dashboard/` | HTTP server + SPA assets + bot-stats |
 | `src/cli/` | tail (router-explain, audit, stats, etc. live in dashboard) |
@@ -54,6 +55,6 @@ Postgres + pgvector backed memory plugin for OpenClaw. Fills `plugins.slots.memo
 
 ## Cross-extension contracts
 
-- Reuses `MemoryEmbeddingProviderAdapter` from `openclaw/plugin-sdk/memory-core-host-engine-embeddings`
+- Self-embeds: an internal `EmbeddingClient` (manager-runtime → OpenAI-compat / Ollama endpoint) does its own embedding. nextclaw is an embedding **consumer**, not a host provider — it does **not** register a `MemoryEmbeddingProviderAdapter` and declares no `contracts.embeddingProviders`
 - Implements `MemorySearchManager` from `openclaw/plugin-sdk/memory-core-host-engine-storage`
 - Exposes `StructuredMemoryAPI` barrel for plugins that want SQL-shaped access

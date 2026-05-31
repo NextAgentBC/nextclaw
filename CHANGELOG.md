@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — Curated recall + action-sensitive memory
+
+Memory-quality work on top of 0.2.1 (branch `feat/memory-0-1`, stacked on
+`fix/dedup-signal-and-tuning-dedup`). Migrations 60/61/62 apply automatically on
+gateway restart. No packaging change — `package.json` stays 0.2.1 until release.
+
+### Recall correctness (migrations 60 / 61)
+
+- **Ingest dedup no longer pollutes the recall signal.** A duplicate re-ingest
+  used to bump `last_recalled_at` (the transcript-watcher re-ingests ~every
+  10s), so re-seen chunks looked perpetually "recalled" and the cold-gist
+  compactor — which ages chunks by `last_recalled_at` — could never demote
+  them. Dedup now bumps a separate `last_seen_at` / `dup_count`;
+  `last_recalled_at` + `recall_count` are reserved for genuine recalls. On the
+  live store this de-polluted 422/500 chunks (84%).
+- **Tuning proposals are deduped.** The daily analyzer re-emitted identical
+  pending proposals every run; `audit.tuning_proposals` had accumulated 23
+  duplicates. A partial unique index `(scope, proposal_type) WHERE
+  status='pending'` + `ON CONFLICT … DO UPDATE` now refreshes the open proposal
+  in place (collapsed 23 → 2 live).
+
+### New agent tools / features (migration 62)
+
+- **`memory_get(chunkId)`** — fetch one chunk in full when a search snippet was
+  truncated. Read-only; fail-closed per-agent isolation (a chunk owned by
+  another agent reads as not-found).
+- **Cited recall** — `memory_search` results now carry an inline
+  `pg://<source>/<chunkId>` citation in the model-visible text (plus a
+  `citation` field in structured details) so the agent can attribute a claim
+  and re-fetch via `memory_get`.
+- **Action-sensitive commitments** — directives the agent might *act* on
+  (cancel / send / authorize / appointments / reminders) are extracted into
+  `structured.commitments` (agent-isolated) with `safe_to_act` /
+  `requires_confirmation` / `authority` / validity fields, and surfaced with a
+  ⚠ flag on recall. Conservative by default: side-effecting directives require
+  confirmation; only "set me a reminder" is safe to act on.
+
+### Hygiene
+
+- Declared `memory_get` in `openclaw.plugin.json` `contracts.tools`.
+- Removed the vestigial `contracts.memoryEmbeddingProviders: ["openai-compat"]`
+  declaration. nextclaw self-embeds and never registered such an adapter, so
+  the declaration was orphaned and only triggered a deprecation advisory in
+  `openclaw plugins inspect`. (nextclaw is an embedding *consumer*, not a
+  host-facing provider.)
+
 ## 0.2.1 — Curl-first install + distribution fixes
 
 0.2.1 is a packaging / install-UX release. No new runtime features — the focus
