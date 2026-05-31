@@ -14,11 +14,25 @@
  *     analyzer; the actual config patcher lives in OpenClaw core.
  */
 import { randomUUID } from "node:crypto";
+// One open proposal per (scope, proposal_type): the daily analyzer re-runs and
+// would otherwise pile up identical pending rows. ON CONFLICT against the
+// partial unique index (see storage/schema/61-tuning-dedup.sql) refreshes the
+// open proposal in place instead of duplicating it.
 const PROPOSAL_INSERT = `
   INSERT INTO audit.tuning_proposals
     (id, cadence, scope, proposal_type, current_value, proposed_value,
      evidence, risk_class, status, reason, config_path)
    VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb, $8, 'pending', $9, $10)
+   ON CONFLICT (scope, proposal_type) WHERE status = 'pending'
+     DO UPDATE SET
+       ts             = now(),
+       cadence        = EXCLUDED.cadence,
+       current_value  = EXCLUDED.current_value,
+       proposed_value = EXCLUDED.proposed_value,
+       evidence       = EXCLUDED.evidence,
+       risk_class     = EXCLUDED.risk_class,
+       reason         = EXCLUDED.reason,
+       config_path    = EXCLUDED.config_path
    RETURNING id`;
 async function writeProposal(pool, cadence, payload) {
     const id = randomUUID();

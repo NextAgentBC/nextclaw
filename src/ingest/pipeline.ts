@@ -307,8 +307,11 @@ export async function ingestOne(deps: IngestDeps, input: IngestInput): Promise<I
   );
   if (dup.rowCount && dup.rowCount > 0) {
     const id = dup.rows[0].id;
+    // Re-ingest (dedup), not a recall — bump last_seen_at / dup_count only.
+    // last_recalled_at stays reserved for genuine recall hits so the cold
+    // compactor can still age these chunks. See storage/schema/60-last-seen.sql.
     await deps.pool.query(
-      "UPDATE semantic.chunks SET last_recalled_at = now() WHERE id = $1",
+      "UPDATE semantic.chunks SET last_seen_at = now(), dup_count = dup_count + 1 WHERE id = $1",
       [id],
     );
     return finalize(

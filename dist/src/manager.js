@@ -141,7 +141,12 @@ export async function writeChunk(pool, embedding, input) {
     const textHash = hashTextBytes(input.text);
     const dup = await pool.query("SELECT id FROM semantic.chunks WHERE text_hash = $1 AND source = $2", [textHash, input.source]);
     if (dup.rowCount && dup.rowCount > 0) {
-        await pool.query("UPDATE semantic.chunks SET last_recalled_at = now() WHERE id = $1", [dup.rows[0].id]);
+        // Dedup hit: this is a re-ingest, not a recall. Bump last_seen_at / dup_count
+        // and leave last_recalled_at + recall_count untouched — the cold-gist
+        // compactor ages chunks by last_recalled_at, so conflating the two would
+        // keep re-seen chunks perpetually "warm" and they'd never compact.
+        // See src/storage/schema/60-last-seen.sql.
+        await pool.query("UPDATE semantic.chunks SET last_seen_at = now(), dup_count = dup_count + 1 WHERE id = $1", [dup.rows[0].id]);
         return { id: dup.rows[0].id, written: false };
     }
     const embed = await embedding.embed({ inputs: [input.text] });
