@@ -4,7 +4,7 @@
 > 4-tier recall · multi-key Xinhua-dictionary indexing · deterministic-first ingest · hard per-agent isolation · real-time dashboard.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-![Status: 0.1.0](https://img.shields.io/badge/status-0.1.0-orange)
+![Status: 0.3.0](https://img.shields.io/badge/status-0.3.0-blue)
 
 ```
    ┌────────────────────────────────────────────────────────────┐

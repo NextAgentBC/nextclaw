@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased — Curated recall + action-sensitive memory
+## 0.3.0 — Curated recall + action-sensitive memory
 
-Memory-quality work on top of 0.2.1 (branch `feat/memory-0-1`, stacked on
-`fix/dedup-signal-and-tuning-dedup`). Migrations 60/61/62 apply automatically on
-gateway restart. No packaging change — `package.json` stays 0.2.1 until release.
+Memory-quality release on top of 0.2.1 (merged via #21, 2026-05-31). Two
+recall-correctness fixes plus the SESSION-HANDOFF "0,1" feature scope.
+Migrations 60/61/62 apply automatically on gateway restart.
 
 ### Recall correctness (migrations 60 / 61)
 
