@@ -10,6 +10,7 @@ import { buildEmbeddingClientFromConfig } from "./embedding/client.js";
 import { forgetChunk, getChunk, updateChunk } from "./edit/operations.js";
 import { ingestOne } from "./ingest/pipeline.js";
 import { recall } from "./recall/router.js";
+import { getActiveCommitmentsByChunk } from "./structured/commitments.js";
 import { ensureHnswIndex, migrate } from "./storage/migrate.js";
 import { getPool } from "./storage/pool.js";
 const SEARCH_PARAMS = {
@@ -215,6 +216,7 @@ export function buildSearchTool(args) {
                 userId: p.viewerUserId ?? inferredViewer.userId,
                 chatId: p.viewerChatId ?? inferredViewer.chatId,
             };
+            const agentId = agentIdFromSessionKey(args.sessionKey);
             const result = await recall({ cfg, pool, embedding }, {
                 query: p.query,
                 maxResults: p.limit ?? 5,
@@ -225,7 +227,7 @@ export function buildSearchTool(args) {
                 },
                 timeBucket: p.timeBucket,
                 agentSessionId: args.sessionKey,
-                agentId: agentIdFromSessionKey(args.sessionKey),
+                agentId,
                 // Only attach viewer when we actually have something to filter on;
                 // an empty viewer object signals "no filtering" to the router.
                 viewer: viewer.userId || viewer.chatId ? viewer : undefined,
@@ -241,12 +243,27 @@ export function buildSearchTool(args) {
                     },
                 };
             }
+            // Action-sensitive flags: a recalled directive the agent might ACT on is
+            // marked so it won't fire on a stray remark. Agent-scoped (isolation).
+            const commitmentList = await getActiveCommitmentsByChunk(pool, result.results.map((c) => c.chunkId), agentId);
+            const commitmentByChunk = new Map();
+            for (const cm of commitmentList) {
+                if (!commitmentByChunk.has(cm.chunkId)) {
+                    commitmentByChunk.set(cm.chunkId, cm);
+                }
+            }
             const lines = result.results.map((c, i) => {
                 const tier = c.hits.join("+");
+                const cm = commitmentByChunk.get(c.chunkId);
+                const flag = cm
+                    ? cm.requiresConfirmation
+                        ? ` ⚠ ${cm.kind}: confirm with the user before acting`
+                        : ` ⚑ ${cm.kind}`
+                    : "";
                 // Inline citation (full chunkId) so the model can attribute a claim and
                 // re-fetch the complete text via memory_get. Same handle as
                 // details.results[].citation below.
-                return `${i + 1}. [${tier}] ${c.text.slice(0, 220)}\n   ↳ pg://${c.source}/${c.chunkId}`;
+                return `${i + 1}. [${tier}]${flag} ${c.text.slice(0, 220)}\n   ↳ pg://${c.source}/${c.chunkId}`;
             });
             return {
                 content: [
@@ -271,6 +288,7 @@ export function buildSearchTool(args) {
                         text: c.text,
                         score: c.combinedScore,
                         hits: c.hits,
+                        commitment: commitmentByChunk.get(c.chunkId) ?? null,
                     })),
                 },
             };
@@ -340,14 +358,18 @@ export function buildGetTool(args) {
                 };
             }
             const c = outcome.chunk;
+            const cm = (await getActiveCommitmentsByChunk(pool, [c.chunkId], agentId))[0] ?? null;
+            const flag = cm?.requiresConfirmation
+                ? `\n⚠ action-sensitive (${cm.kind}) — confirm with the user before acting on this.`
+                : "";
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Memory chunk [${c.kind}, ${c.retentionClass}] — ${c.citation}\n${c.text}`,
+                        text: `Memory chunk [${c.kind}, ${c.retentionClass}] — ${c.citation}\n${c.text}${flag}`,
                     },
                 ],
-                details: { found: true, ...c },
+                details: { found: true, ...c, commitment: cm },
             };
         },
     };

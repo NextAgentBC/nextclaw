@@ -17,6 +17,7 @@
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type {
+  CommitmentCandidate,
   EntityCandidate,
   EventCandidate,
   ExtractorResult,
@@ -31,6 +32,8 @@ export type ReconcileInput = {
   result: ExtractorResult;
   /** Optional dream run id; null when ingesting outside a dream sweep. */
   dreamRunId?: string | null;
+  /** Owning agent — threaded onto commitments for hard isolation. Default 'main'. */
+  agentId?: string;
 };
 
 export type ReconcileOutcome = {
@@ -39,6 +42,7 @@ export type ReconcileOutcome = {
   eventIds: string[];
   preferenceIds: string[];
   metricIds: string[];
+  commitmentIds: string[];
   /** Number of dedup hits (rows that didn't need a new INSERT). */
   dedupCount: number;
 };
@@ -53,6 +57,7 @@ export async function reconcile(pool: Pool, input: ReconcileInput): Promise<Reco
       eventIds: [],
       preferenceIds: [],
       metricIds: [],
+      commitmentIds: [],
       dedupCount: 0,
     };
 
@@ -107,6 +112,13 @@ export async function reconcile(pool: Pool, input: ReconcileInput): Promise<Reco
       const { id, deduped } = await upsertMetric(client, m);
       if (deduped) {out.dedupCount += 1;}
       out.metricIds.push(id);
+    }
+
+    const agentId = input.agentId ?? "main";
+    for (const c of input.result.commitments) {
+      const { id, deduped } = await upsertCommitment(client, c, agentId, input.chunkId);
+      if (deduped) {out.dedupCount += 1;}
+      out.commitmentIds.push(id);
     }
 
     // Provenance — one row per *new* structured insertion (skip dedups).
@@ -313,6 +325,40 @@ async function upsertMetric(
   return { id, deduped: false };
 }
 
+/* ------------------------------- commitments ------------------------------- */
+
+async function upsertCommitment(
+  client: PoolClient,
+  c: CommitmentCandidate,
+  agentId: string,
+  chunkId: string,
+): Promise<{ id: string; deduped: boolean }> {
+  // Dedup an identical active directive for the same agent (e.g. the same rule
+  // re-stated). The supersede chain (invalidated_at + supersedes) is left for a
+  // later pass; v1 just avoids exact-duplicate rows.
+  const existing = await client.query<{ id: string }>(
+    `SELECT id FROM structured.commitments
+       WHERE agent_id = $1 AND kind = $2 AND directive = $3 AND invalidated_at IS NULL
+       LIMIT 1`,
+    [agentId, c.kind, c.directive],
+  );
+  if (existing.rowCount && existing.rowCount > 0) {
+    return { id: existing.rows[0].id, deduped: true };
+  }
+  const id = randomUUID();
+  await client.query(
+    `INSERT INTO structured.commitments
+       (id, agent_id, chunk_id, directive, kind, safe_to_act, requires_confirmation,
+        authority, valid_from, expires_at, confidence)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      id, agentId, chunkId, c.directive, c.kind, c.safeToAct, c.requiresConfirmation,
+      c.authority ?? null, c.validFrom ?? null, c.expiresAt ?? null, c.confidence,
+    ],
+  );
+  return { id, deduped: false };
+}
+
 /* ------------------------------- provenance -------------------------------- */
 
 async function writeProvenance(
@@ -326,6 +372,7 @@ async function writeProvenance(
   for (const id of out.eventIds)      {rows.push(["event", id, "events"]);}
   for (const id of out.preferenceIds) {rows.push(["preference", id, "preferences"]);}
   for (const id of out.metricIds)     {rows.push(["metric", id, "metrics"]);}
+  for (const id of out.commitmentIds) {rows.push(["commitment", id, "commitments"]);}
   if (rows.length === 0) {return;}
 
   // Insert one row per new structured item. Multi-row INSERT with explicit

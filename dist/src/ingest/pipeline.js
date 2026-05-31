@@ -290,6 +290,7 @@ export async function ingestOne(deps, input) {
         rawExcerpt: text,
         result: extractor,
         dreamRunId,
+        agentId,
     });
     await writeEntityRefIndexes(deps.pool, chunkId, reconcileOut.entityIds);
     if (reconcileOut.entityIds.length > 0) {

@@ -385,6 +385,7 @@ export async function ingestOne(deps: IngestDeps, input: IngestInput): Promise<I
     rawExcerpt: text,
     result: extractor,
     dreamRunId,
+    agentId,
   });
   await writeEntityRefIndexes(deps.pool, chunkId, reconcileOut.entityIds);
   if (reconcileOut.entityIds.length > 0) {routes.push("entity_ref");}

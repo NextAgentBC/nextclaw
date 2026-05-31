@@ -164,6 +164,7 @@ const EMPTY = {
     events: [],
     preferences: [],
     metrics: [],
+    commitments: [],
     extractorVersion: SIDECAR_VERSION,
 };
 export function parseSidecar(text, now) {
@@ -207,6 +208,9 @@ export function parseSidecar(text, now) {
                 .map((v) => coerceMetric(v, now))
                 .filter((m2) => m2 !== null)
             : [],
+        // Commitments are extracted deterministically (extractors.ts); the LLM
+        // sidecar prompt doesn't emit them yet, so default to none here.
+        commitments: [],
         extractorVersion: SIDECAR_VERSION,
     };
     return { found: true, ok: true, result };
@@ -224,6 +228,7 @@ export function mergeExtractorResults(primary, secondary) {
         events: dedupBy([...primary.events, ...secondary.events], (e) => `${e.ts.toISOString().slice(0, 16)}|${e.type}`),
         preferences: dedupBy([...primary.preferences, ...secondary.preferences], (p) => `${p.scope}|${p.key}`),
         metrics: dedupBy([...primary.metrics, ...secondary.metrics], (m) => `${m.ts.toISOString()}|${m.metric}|${JSON.stringify(m.dim ?? {})}`),
+        commitments: dedupBy([...primary.commitments, ...secondary.commitments], (c) => `${c.kind}|${c.directive}`),
         extractorVersion: primary.extractorVersion,
     };
 }

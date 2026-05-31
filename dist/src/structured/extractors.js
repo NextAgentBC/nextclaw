@@ -246,6 +246,37 @@ function extractRelations(ctx) {
     }
     return out;
 }
+/* ------------------------------- commitments ------------------------------ */
+// Action-sensitive directives. The patterns require the directive to be aimed
+// at the agent (帮我/请你 / please/can you / 提醒我 / remind me) so generic
+// imperatives in tutorial or reference text ("delete the file") don't get
+// tagged. Conservative defaults: anything side-effecting is safeToAct=false +
+// requiresConfirmation=true; only "set me a reminder" is safe to act on.
+// Task: an addressee marker followed (within a short span) by a side-effecting verb.
+const COMMIT_TASK = /(?:帮我|请你?|麻烦你?|你能不能|\b(?:please|can you|could you|would you)\b)[\s\S]{0,40}?(?:取消|退订|预订|预定|发送|发邮件|删除|支付|转账|下单|部署|发布|\b(?:cancel|unsubscribe|book|send|email|delete|remove|pay|transfer|order|deploy|publish)\b)/i;
+const COMMIT_AUTH = /(?:我?授权你?|你可以(?:直接)?去?|准许你?|\b(?:I authorize|you (?:can|may|are authorized)|go ahead and|feel free to)\b)/i;
+const COMMIT_APPT = /(?:预约|约了|挂号|\b(?:appointment|booked|reservation|reschedule)\b)/i;
+const COMMIT_REMIND = /(?:提醒我|别忘了|记得(?:要)?|\b(?:remind me|don'?t forget)\b)/i;
+function extractCommitments(ctx) {
+    const t = ctx.text;
+    const authority = ctx.source === "manual" || ctx.source === "session" ? "user_direct" : "inferred";
+    const directive = t.replace(/\s+/g, " ").trim().slice(0, 240);
+    // Highest action-sensitivity wins → at most one commitment per chunk.
+    if (COMMIT_TASK.test(t)) {
+        return [{ directive, kind: "task", safeToAct: false, requiresConfirmation: true, authority, confidence: 0.5 }];
+    }
+    if (COMMIT_AUTH.test(t)) {
+        return [{ directive, kind: "authorization", safeToAct: false, requiresConfirmation: true, authority, confidence: 0.5 }];
+    }
+    if (COMMIT_APPT.test(t)) {
+        return [{ directive, kind: "appointment", safeToAct: false, requiresConfirmation: true, authority, confidence: 0.5 }];
+    }
+    if (COMMIT_REMIND.test(t)) {
+        // Setting a reminder is itself safe; the underlying task still isn't.
+        return [{ directive, kind: "reminder", safeToAct: true, requiresConfirmation: false, authority, confidence: 0.5 }];
+    }
+    return [];
+}
 /* --------------------------------- combine --------------------------------- */
 export function extractAll(ctx) {
     const result = emptyResult(EXTRACTOR_VERSION);
@@ -254,5 +285,6 @@ export function extractAll(ctx) {
     result.events = extractEvents(ctx);
     result.preferences = extractPreferences(ctx);
     result.relations = extractRelations(ctx);
+    result.commitments = extractCommitments(ctx);
     return result;
 }
