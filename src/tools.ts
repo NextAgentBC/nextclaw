@@ -1,15 +1,16 @@
 /**
- * Agent tools exposed by memory-postgres: `memory_search` and `memory_store`.
+ * Agent tools exposed by memory-postgres: `memory_search`, `memory_get`,
+ * `memory_store`, `memory_update`, `memory_forget`.
  *
- * These are thin wrappers over the recall router and ingest pipeline so the
- * agent can read/write the long-term memory in turn.
+ * These are thin wrappers over the recall router, ingest pipeline, and
+ * single-chunk edit ops so the agent can read/write long-term memory in turn.
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
 import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfig, validateConfig } from "./config.js";
 import { buildEmbeddingClientFromConfig } from "./embedding/client.js";
-import { forgetChunk, updateChunk } from "./edit/operations.js";
+import { forgetChunk, getChunk, updateChunk } from "./edit/operations.js";
 import { ingestOne } from "./ingest/pipeline.js";
 import { recall } from "./recall/router.js";
 import { ensureHnswIndex, migrate } from "./storage/migrate.js";
@@ -165,6 +166,19 @@ type ForgetParams = {
   reason?: string;
 };
 
+const GET_PARAMS = {
+  type: "object",
+  additionalProperties: false,
+  required: ["chunkId"],
+  properties: {
+    chunkId: { type: "string", description: "ID of the chunk to fetch in full (from a prior memory_search result)." },
+  },
+} as const;
+
+type GetParams = {
+  chunkId: string;
+};
+
 /**
  * Expected sessionKey shape: `agent:<agentId>:<sessionId>` (or longer with
  * trailing colons for channel-scoped keys). Pull out `<agentId>` so
@@ -294,7 +308,10 @@ export function buildSearchTool(args: { config: OpenClawConfig; sessionKey?: str
 
       const lines = result.results.map((c, i) => {
         const tier = c.hits.join("+");
-        return `${i + 1}. [${tier}] ${c.text.slice(0, 220)}`;
+        // Inline citation (full chunkId) so the model can attribute a claim and
+        // re-fetch the complete text via memory_get. Same handle as
+        // details.results[].citation below.
+        return `${i + 1}. [${tier}] ${c.text.slice(0, 220)}\n   ↳ pg://${c.source}/${c.chunkId}`;
       });
       return {
         content: [
@@ -315,6 +332,7 @@ export function buildSearchTool(args: { config: OpenClawConfig; sessionKey?: str
           results: result.results.map((c) => ({
             chunkId: c.chunkId,
             source: c.source,
+            citation: `pg://${c.source}/${c.chunkId}`,
             text: c.text,
             score: c.combinedScore,
             hits: c.hits,
@@ -368,6 +386,43 @@ export function buildUpdateTool(args: { config: OpenClawConfig; sessionKey?: str
           },
         ],
         details: { decision: "updated", chunkId: outcome.chunkId, reEmbedded: outcome.reEmbedded },
+      };
+    },
+  };
+  return tool as unknown as AnyAgentTool;
+}
+
+export function buildGetTool(args: { config: OpenClawConfig; sessionKey?: string }): AnyAgentTool {
+  const tool = {
+    name: "memory_get",
+    label: "Memory Get",
+    description:
+      "Fetch one memory chunk in full by its id (the chunkId from a prior "
+      + "memory_search result). Use when a search snippet was truncated and you "
+      + "need the complete text plus provenance (source / citation). Read-only. "
+      + "Per-agent isolation enforced — a chunk owned by another agent reads as not found.",
+    parameters: GET_PARAMS as unknown as AnyAgentTool["parameters"],
+    async execute(this: void, _toolCallId: string, params: unknown): Promise<{ content: unknown; details: unknown }> {
+      const p = params as GetParams;
+      const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+      const agentId = agentIdFromSessionKey(args.sessionKey);
+      const outcome = await getChunk({ cfg, pool, embedding }, { chunkId: p.chunkId, agentId });
+
+      if (!outcome.ok) {
+        return {
+          content: [{ type: "text", text: `No memory chunk ${p.chunkId} (${outcome.reason}).` }],
+          details: { found: false, reason: outcome.reason },
+        };
+      }
+      const c = outcome.chunk;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Memory chunk [${c.kind}, ${c.retentionClass}] — ${c.citation}\n${c.text}`,
+          },
+        ],
+        details: { found: true, ...c },
       };
     },
   };

@@ -1,12 +1,13 @@
 /**
- * Agent tools exposed by memory-postgres: `memory_search` and `memory_store`.
+ * Agent tools exposed by memory-postgres: `memory_search`, `memory_get`,
+ * `memory_store`, `memory_update`, `memory_forget`.
  *
- * These are thin wrappers over the recall router and ingest pipeline so the
- * agent can read/write the long-term memory in turn.
+ * These are thin wrappers over the recall router, ingest pipeline, and
+ * single-chunk edit ops so the agent can read/write long-term memory in turn.
  */
 import { resolveConfig, validateConfig } from "./config.js";
 import { buildEmbeddingClientFromConfig } from "./embedding/client.js";
-import { forgetChunk, updateChunk } from "./edit/operations.js";
+import { forgetChunk, getChunk, updateChunk } from "./edit/operations.js";
 import { ingestOne } from "./ingest/pipeline.js";
 import { recall } from "./recall/router.js";
 import { ensureHnswIndex, migrate } from "./storage/migrate.js";
@@ -118,6 +119,14 @@ const FORGET_PARAMS = {
         chunkId: { type: "string", description: "ID of the chunk to forget (from prior memory_search result)." },
         hardDelete: { type: "boolean", description: "When true, fully delete (breaks cold-gist back-references). When false (default), soft-trash so it stops appearing in recall but can be audited." },
         reason: { type: "string", description: "Why you're forgetting this — recorded in the audit row." },
+    },
+};
+const GET_PARAMS = {
+    type: "object",
+    additionalProperties: false,
+    required: ["chunkId"],
+    properties: {
+        chunkId: { type: "string", description: "ID of the chunk to fetch in full (from a prior memory_search result)." },
     },
 };
 /**
@@ -234,7 +243,10 @@ export function buildSearchTool(args) {
             }
             const lines = result.results.map((c, i) => {
                 const tier = c.hits.join("+");
-                return `${i + 1}. [${tier}] ${c.text.slice(0, 220)}`;
+                // Inline citation (full chunkId) so the model can attribute a claim and
+                // re-fetch the complete text via memory_get. Same handle as
+                // details.results[].citation below.
+                return `${i + 1}. [${tier}] ${c.text.slice(0, 220)}\n   ↳ pg://${c.source}/${c.chunkId}`;
             });
             return {
                 content: [
@@ -255,6 +267,7 @@ export function buildSearchTool(args) {
                     results: result.results.map((c) => ({
                         chunkId: c.chunkId,
                         source: c.source,
+                        citation: `pg://${c.source}/${c.chunkId}`,
                         text: c.text,
                         score: c.combinedScore,
                         hits: c.hits,
@@ -301,6 +314,40 @@ export function buildUpdateTool(args) {
                     },
                 ],
                 details: { decision: "updated", chunkId: outcome.chunkId, reEmbedded: outcome.reEmbedded },
+            };
+        },
+    };
+    return tool;
+}
+export function buildGetTool(args) {
+    const tool = {
+        name: "memory_get",
+        label: "Memory Get",
+        description: "Fetch one memory chunk in full by its id (the chunkId from a prior "
+            + "memory_search result). Use when a search snippet was truncated and you "
+            + "need the complete text plus provenance (source / citation). Read-only. "
+            + "Per-agent isolation enforced — a chunk owned by another agent reads as not found.",
+        parameters: GET_PARAMS,
+        async execute(_toolCallId, params) {
+            const p = params;
+            const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
+            const agentId = agentIdFromSessionKey(args.sessionKey);
+            const outcome = await getChunk({ cfg, pool, embedding }, { chunkId: p.chunkId, agentId });
+            if (!outcome.ok) {
+                return {
+                    content: [{ type: "text", text: `No memory chunk ${p.chunkId} (${outcome.reason}).` }],
+                    details: { found: false, reason: outcome.reason },
+                };
+            }
+            const c = outcome.chunk;
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Memory chunk [${c.kind}, ${c.retentionClass}] — ${c.citation}\n${c.text}`,
+                    },
+                ],
+                details: { found: true, ...c },
             };
         },
     };

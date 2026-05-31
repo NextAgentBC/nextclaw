@@ -26,6 +26,7 @@ import { migrate, ensureHnswIndex } from "./src/storage/migrate.js";
 import { closePool, getPool, type ResolvedPoolConfig } from "./src/storage/pool.js";
 import {
   buildForgetTool,
+  buildGetTool,
   buildSearchTool,
   buildStoreTool,
   buildUpdateTool,
@@ -152,6 +153,17 @@ export default definePluginEntry({
         return buildSearchTool({ config, sessionKey: ctx.sessionKey });
       },
       { names: ["memory_search"] },
+    );
+
+    api.registerTool(
+      (ctx) => {
+        const config = ctx.getRuntimeConfig?.() ?? ctx.runtimeConfig ?? ctx.config;
+        if (!config) {
+          throw new Error("memory-postgres: no runtime config available in tool context");
+        }
+        return buildGetTool({ config, sessionKey: ctx.sessionKey });
+      },
+      { names: ["memory_get"] },
     );
 
     api.registerTool(
@@ -782,7 +794,7 @@ export default definePluginEntry({
 
     api.logger.info(
       "memory-postgres: capability + tools registered "
-        + "(memory_search, memory_store, memory_update, memory_forget; "
+        + "(memory_search, memory_get, memory_store, memory_update, memory_forget; "
         + "services: dashboard, tuning, compactor, reflection)",
     );
   },
