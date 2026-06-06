@@ -56,6 +56,7 @@
 Standalone OpenClaw skills that compose well with nextclaw:
 
 - **[openclaw-skill-reminder](https://github.com/NextAgentBC/openclaw-skill-reminder)** — privacy-conscious time-based reminders. The cron config file only sees opaque `reminder:<short-id>` names; the actual detail (names, addresses, appointments) lives in a mode-600 file. Used by `/dashboard` users to schedule follow-ups without leaking PII into `jobs.json`.
+- **[openclaw-selfcare](skills/openclaw-selfcare/)** — *bundled in this repo* (`skills/openclaw-selfcare/`). Safely keeps a host's OpenClaw core **and this plugin** up to date: a sandbox compatibility preflight runs before any upgrade (does the new openclaw still load the plugin and resolve its deps?), it auto-fixes the safely-fixable (bump the plugin to a compatible tag, install a missing transitive dep such as `undici`), and it refuses to upgrade onto a broken or incompatible state. Read-only `check` by default; `apply` to actually upgrade. See [`skills/openclaw-selfcare/SKILL.md`](skills/openclaw-selfcare/SKILL.md).
 
 ## Quick start (~5 min on Neon, ~10 min on Docker)
 

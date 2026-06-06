@@ -39,3 +39,5 @@ Thumbs.db
 **/.dashboard.env
 **/auth-profiles.json
 **/auth-state.json
+**/config.env
+!**/config.env.example

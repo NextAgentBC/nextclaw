@@ -29,6 +29,7 @@ Postgres + pgvector backed memory plugin for OpenClaw. Fills `plugins.slots.memo
 | `src/sdk/` | StructuredMemoryAPI public exports |
 | `src/dashboard/` | HTTP server + SPA assets + bot-stats |
 | `src/cli/` | tail (router-explain, audit, stats, etc. live in dashboard) |
+| `skills/` | OpenClaw ops skills shipped with the plugin (currently `openclaw-selfcare` — safe self-upgrade of openclaw + this plugin) |
 
 ## Rules
 
@@ -52,6 +53,7 @@ Postgres + pgvector backed memory plugin for OpenClaw. Fills `plugins.slots.memo
 
 - `pg` (node-postgres) — supports LISTEN/NOTIFY which the dashboard needs
 - `pgvector` — pgvector type binding for `pg`
+- `undici` — HTTP client for the IPv4-first dispatcher to `api.telegram.org` (`src/moderator/telegram-api.ts`). Declared directly, not relied on transitively, so an OpenClaw dependency-tree change can't make it vanish.
 
 ## Cross-extension contracts
 
