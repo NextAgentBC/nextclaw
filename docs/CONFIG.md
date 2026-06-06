@@ -1,5 +1,7 @@
 # nextclaw — configuration reference
 
+**English** · [简体中文](CONFIG.zh-CN.md)
+
 Every config field, default, and tuning advice. Lives under
 `plugins.entries.memory-postgres.config` in your `~/.openclaw/openclaw.json`.
 

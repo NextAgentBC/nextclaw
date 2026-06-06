@@ -1,5 +1,7 @@
 # nextclaw
 
+**English** · [简体中文](README.zh-CN.md)
+
 > Postgres + pgvector long-term memory plugin for [OpenClaw](https://github.com/openclaw/openclaw).
 > 4-tier recall · multi-key Xinhua-dictionary indexing · deterministic-first ingest · hard per-agent isolation · real-time dashboard.
 

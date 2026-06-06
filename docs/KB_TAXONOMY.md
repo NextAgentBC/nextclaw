@@ -1,5 +1,7 @@
 # KB filesystem taxonomy
 
+**English** · [简体中文](KB_TAXONOMY.zh-CN.md)
+
 > Every file the bot ever sees — whether uploaded via Telegram, dropped
 > in by the teacher with `scp`, or fed in by a future web upload UI —
 > lives under one root directory with one set of rules. The rules are

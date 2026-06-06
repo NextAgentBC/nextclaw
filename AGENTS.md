@@ -1,5 +1,7 @@
 # nextclaw — contributor guide
 
+**English** · [简体中文](AGENTS.zh-CN.md)
+
 Postgres + pgvector backed memory plugin for OpenClaw. Fills `plugins.slots.memory`.
 
 ## Scope

@@ -1,5 +1,7 @@
 # nextclaw architecture
 
+**English** · [简体中文](ARCHITECTURE.zh-CN.md)
+
 > Why a Postgres-backed memory plugin looks the way it does, and how the
 > pieces fit together.
 
