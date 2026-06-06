@@ -1,5 +1,7 @@
 # openclaw-selfcare
 
+**English** · [简体中文](README.zh-CN.md)
+
 A small OpenClaw **ops skill** that keeps one host's OpenClaw core and the nextclaw
 (`memory-postgres`) plugin up to date — *safely*.
 

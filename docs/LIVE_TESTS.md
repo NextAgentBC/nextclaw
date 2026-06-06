@@ -1,5 +1,7 @@
 # Live tests
 
+**English** · [简体中文](LIVE_TESTS.zh-CN.md)
+
 Most files under `test/` are gated by `OPENCLAW_LIVE_TEST=1` because
 they require a running Postgres + embedding endpoint and we don't want
 CI failures in environments without those.

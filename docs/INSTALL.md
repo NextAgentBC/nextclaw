@@ -1,5 +1,7 @@
 # nextclaw — 0 → 1 installation walkthrough
 
+**English** · [简体中文](INSTALL.zh-CN.md)
+
 This is the **fresh-machine** guide. If you already have OpenClaw + an
 embedding endpoint running, jump to step ④.
 

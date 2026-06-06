@@ -1,5 +1,7 @@
 # External services nextclaw uses
 
+**English** · [简体中文](SERVICES.zh-CN.md)
+
 This doc lists every external service nextclaw can talk to, **why** you'd want it, **where to sign up**, and the **exact env var / config snippet** to wire it in.
 
 Written so both an AI agent (looking for `bash` blocks + JSON paths to act on) and a human (looking for the "why") can use it.
