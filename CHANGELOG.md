@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`openclaw-selfcare` skill** (`skills/openclaw-selfcare/`) — a bundled OpenClaw
+  ops skill that safely keeps a host's OpenClaw core **and this plugin** up to date.
+  Before any upgrade it runs a **sandbox compatibility preflight**: it installs the
+  target openclaw into a throwaway prefix and checks that this plugin still satisfies
+  the new openclaw's declared range and that the plugin's runtime deps still resolve.
+  It auto-fixes the safely-fixable (bump the plugin to a compatible tag; install a
+  missing transitive dep such as `undici`), upgrades openclaw **only if preflight
+  passes**, then updates the plugin and verifies the gateway + memory probe recovered.
+  Refuses to upgrade onto an already-broken install or across a release flagged
+  breaking. Read-only `check`/`preflight`; `apply` performs the upgrade. Optional
+  daily cron and Telegram reporting. See `skills/openclaw-selfcare/SKILL.md`.
+
+### Fixed
+
+- **Declare `undici` as a direct dependency (`^8.3.0`).** `src/moderator/telegram-api.ts`
+  imports `undici` directly (`Agent` + an IPv4-first `fetch` dispatcher for
+  `api.telegram.org`), but it was only present transitively via OpenClaw's dependency
+  tree. A change to that tree — or installing the plugin without the same hoisting —
+  could make `undici` vanish at runtime and break the Telegram send path. It is now a
+  declared dependency so it can't disappear. (No behavior change; the resolved version
+  is unchanged.)
+
 ## 0.3.1 — Opt-in memory sidecar (stop the `<mem>` leak)
 
 Patch release on top of 0.3.0. One behavior change, no migrations.
