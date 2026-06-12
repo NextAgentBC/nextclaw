@@ -1,0 +1,24 @@
+{
+  "metrics": {
+    "cases": 7,
+    "recallAt5": 1,
+    "mrr": 1,
+    "p50ms": 16,
+    "p95ms": 20,
+    "tierDistribution": {
+      "t2_hybrid": 6,
+      "t2_anchor": 1
+    },
+    "routesExercised": [
+      "anchor",
+      "category",
+      "concept_tag",
+      "entity_ref",
+      "fulltext",
+      "graph_walk",
+      "semantic",
+      "time_bucket",
+      "trgm"
+    ]
+  }
+}
