@@ -615,6 +615,41 @@
           }
         }
       },
+      "residual": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Stage 4 LLM residual extractor — deep extraction (preferences) for the regex long tail, fired on low-confidence chunks. Off by default. Fail-soft on errors; RPM + daily-token guards keep a free-tier model safe.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "maxRpm": {
+            "type": "number",
+            "minimum": 1,
+            "description": "Requests/minute cap (the broker rotates keys; this stops bursts like a transcript replay). Default 8."
+          },
+          "dailyTokenBudget": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Daily residual token budget; deep extraction pauses for the day past it. Default 50000."
+          },
+          "model": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["format"],
+            "properties": {
+              "format": {
+                "type": "string",
+                "enum": ["openai", "gemini"]
+              },
+              "baseUrl": { "type": "string" },
+              "model": { "type": "string" },
+              "apiKeyEnv": { "type": "string" }
+            }
+          }
+        }
+      },
       "reflection": {
         "type": "object",
         "additionalProperties": false,

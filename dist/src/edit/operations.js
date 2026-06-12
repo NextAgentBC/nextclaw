@@ -19,6 +19,7 @@
  */
 import { randomUUID } from "node:crypto";
 import pgvector from "pgvector/pg";
+import { invalidateChunk } from "./invalidate.js";
 export async function updateChunk(deps, params) {
     const existing = await deps.pool.query(`SELECT agent_id, text FROM semantic.chunks WHERE id = $1`, [params.chunkId]);
     if (existing.rowCount === 0) {
@@ -74,15 +75,9 @@ export async function updateChunk(deps, params) {
        VALUES ($1, 'edit', null, $2, 'updated', 'edit_update',
                100, '', $3, $4, now())`, [randomUUID(), params.agentId, params.chunkId, params.reason ?? null])
         .catch(() => { });
-    // Invalidate cache.recall entries that might have surfaced this chunk
-    // with stale text. Cheap broad invalidation; cache.recall is UNLOGGED.
-    await deps.pool
-        .query(`UPDATE cache.recall SET invalidated = true WHERE invalidated = false`)
-        .catch(() => undefined);
-    // Drop hot_chunks for this chunk so T1 doesn't keep the old warmth.
-    await deps.pool
-        .query(`DELETE FROM cache.hot_chunks WHERE chunk_id = $1`, [params.chunkId])
-        .catch(() => undefined);
+    // Invalidate every cache tier (T0 working sets, hot_chunks, recall, QA) that
+    // might still serve the now-stale text.
+    await invalidateChunk(deps.pool, params.chunkId, "edit_update");
     return { ok: true, chunkId: params.chunkId, reEmbedded };
 }
 export async function forgetChunk(deps, params) {
@@ -100,21 +95,15 @@ export async function forgetChunk(deps, params) {
         ]);
         await deps.pool.query(`DELETE FROM semantic.chunk_indexes WHERE chunk_id = $1`, [params.chunkId])
             .catch(() => undefined);
-        await deps.pool.query(`DELETE FROM cache.hot_chunks WHERE chunk_id = $1`, [params.chunkId])
-            .catch(() => undefined);
     }
     else {
         await deps.pool.query(`UPDATE semantic.chunks
           SET retention_class = 'trash',
               updated_at = now()
         WHERE id = $1 AND agent_id = $2`, [params.chunkId, params.agentId]);
-        await deps.pool.query(`DELETE FROM cache.hot_chunks WHERE chunk_id = $1`, [params.chunkId])
-            .catch(() => undefined);
     }
-    // Bust cache.recall broadly — cheap, UNLOGGED.
-    await deps.pool
-        .query(`UPDATE cache.recall SET invalidated = true WHERE invalidated = false`)
-        .catch(() => undefined);
+    // Invalidate every cache tier (T0 working sets, hot_chunks, recall, QA).
+    await invalidateChunk(deps.pool, params.chunkId, mode === "tombstone" ? "forget_tombstone" : "forget_trash");
     await deps.pool
         .query(`INSERT INTO audit.ingest_decisions
          (id, source, agent_session_id, agent_id, decision, ingest_path,

@@ -25,6 +25,7 @@ import type {
 } from "../config.js";
 import type { EmbeddingClient } from "../embedding/client.js";
 import { ingestOne, type IngestInput, type IngestOutcome } from "../ingest/pipeline.js";
+import type { LlmResidual } from "../ingest/residual.js";
 
 /* --------------------------------- types --------------------------------- */
 
@@ -46,6 +47,8 @@ export type TranscriptWatcherDeps = {
   cfg: ResolvedMemoryPostgresConfig;
   pool: Pool;
   embedding: EmbeddingClient;
+  /** Optional Stage 4 deep-extraction hook (off unless residual.enabled). */
+  llmResidual?: LlmResidual;
   watcher: ResolvedTranscriptWatcher;
   logger?: { info: (m: string) => void; warn: (m: string) => void };
 };

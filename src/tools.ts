@@ -12,7 +12,9 @@ import { resolveConfig, validateConfig } from "./config.js";
 import { buildEmbeddingClientFromConfig } from "./embedding/client.js";
 import { forgetChunk, getChunk, updateChunk } from "./edit/operations.js";
 import { ingestOne } from "./ingest/pipeline.js";
+import { buildResidualExtractor } from "./ingest/residual.js";
 import { recall } from "./recall/router.js";
+import { recordCitationFollowup } from "./recall/relevance.js";
 import { getActiveCommitmentsByChunk } from "./structured/commitments.js";
 import { ensureHnswIndex, migrate } from "./storage/migrate.js";
 import { getPool } from "./storage/pool.js";
@@ -434,6 +436,11 @@ export function buildGetTool(args: { config: OpenClawConfig; sessionKey?: string
         };
       }
       const c = outcome.chunk;
+      // P0#2: a citation follow-up (memory_get on a recalled chunk) is a
+      // positive relevance signal for the recall that surfaced it. Fire-and-
+      // forget; never block the read.
+      void recordCitationFollowup(pool, agentId, c.chunkId, cfg.scoring.recall.relevanceFollowupWindowMs)
+        .catch(() => undefined);
       const cm = (await getActiveCommitmentsByChunk(pool, [c.chunkId], agentId))[0] ?? null;
       const flag = cm?.requiresConfirmation
         ? `\n⚠ action-sensitive (${cm.kind}) — confirm with the user before acting on this.`
@@ -516,7 +523,7 @@ export function buildStoreTool(args: { config: OpenClawConfig; sessionKey?: stri
       const p = params as StoreParams;
       const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
       const outcome = await ingestOne(
-        { cfg, pool, embedding },
+        { cfg, pool, embedding, llmResidual: buildResidualExtractor(cfg) },
         {
           text: p.text,
           source: "manual",

@@ -196,6 +196,18 @@ export async function recordCacheHit(pool, id) {
 export async function invalidateCachedAnswer(pool, id, reason) {
     await pool.query(`UPDATE cache.qa SET invalidated = true, invalidated_reason = $2 WHERE id = $1`, [id, reason]);
 }
+/**
+ * Invalidate every cached answer derived from a given source chunk/doc. Called
+ * from the chunk-invalidation path so a forgotten/rewritten chunk stops serving
+ * a stale answer — without this the QA cache's 90-day TTL outlives the fact.
+ * Matches on `source_doc_id`, the direct provenance link. Returns the count
+ * invalidated.
+ */
+export async function invalidateCachedAnswersByDoc(pool, sourceDocId, reason) {
+    const r = await pool.query(`UPDATE cache.qa SET invalidated = true, invalidated_reason = $2
+       WHERE source_doc_id = $1 AND NOT invalidated`, [sourceDocId, reason]);
+    return r.rowCount ?? 0;
+}
 export async function recordCacheFeedback(pool, id, vote) {
     await pool.query(vote === "up"
         ? `UPDATE cache.qa SET upvotes = upvotes + 1 WHERE id = $1`

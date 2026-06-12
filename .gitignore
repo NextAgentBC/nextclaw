@@ -33,6 +33,7 @@ Thumbs.db
 /tmp/
 *.swp
 *.bak
+test/golden/last-run.json
 
 # Personal config that should never be committed
 **/openclaw.json

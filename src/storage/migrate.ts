@@ -89,16 +89,25 @@ export async function migrate(pool: Pool): Promise<MigrationResult> {
     }
   }
 
-  // HNSW index is dim-locked, so we defer until embedding probe writes the
-  // dimension to audit.plugin_meta. Returns whether we still need to do it.
+  // Enable pgvectorscale if its files are installed (the custom image). On a
+  // plain pgvector image this is a guarded no-op. Lets ensureHnswIndex pick
+  // DiskANN, which — unlike HNSW — indexes >2000-dim vectors.
+  await pool.query("CREATE EXTENSION IF NOT EXISTS vectorscale CASCADE").catch(() => undefined);
+
+  // The vector index is dim-locked, so we defer until the embedding probe
+  // writes the dimension to audit.plugin_meta. Returns whether it's still owed.
   const hnswDeferred = !(await ensureHnswIndex(pool));
   return { applied, skipped, hnswDeferred };
 }
 
 /**
- * Create the HNSW vector index on semantic.chunks once we know the embedding
- * dimension. Returns true when the index now exists, false if dim is still
- * unknown (caller should retry after embedding probe).
+ * Create the ANN vector index on semantic.chunks once we know the embedding
+ * dimension. Prefers pgvectorscale's DiskANN when the `vectorscale` extension
+ * is present — its SBQ-compressed layout indexes high-dim vectors (e.g. 4096-d
+ * Qwen3-Embedding-8B), whereas pgvector's HNSW is capped at 2000 dims by the
+ * 8 KB index-tuple page limit. Falls back to HNSW (≤2000). Returns true when an
+ * index now exists; false if the dim is still unknown, or it's >2000 and only
+ * HNSW is available (recall then runs as an exact scan until DiskANN is added).
  */
 export async function ensureHnswIndex(pool: Pool): Promise<boolean> {
   const meta = await pool.query<{ value: { dims?: number } }>(
@@ -107,24 +116,33 @@ export async function ensureHnswIndex(pool: Pool): Promise<boolean> {
   const dims = meta.rows[0]?.value?.dims;
   if (typeof dims !== "number" || dims <= 0) {return false;}
 
-  // Check if index already exists.
+  // Either index method already present → done.
   const existing = await pool.query(
     `SELECT 1 FROM pg_indexes
-       WHERE schemaname = 'semantic'
-         AND tablename  = 'chunks'
-         AND indexname  = 'chunks_hnsw'`,
+       WHERE schemaname = 'semantic' AND tablename = 'chunks'
+         AND indexname IN ('chunks_hnsw', 'chunks_diskann')`,
   );
   if (existing.rowCount && existing.rowCount > 0) {return true;}
 
-  // pgvector HNSW requires the column to be declared with a fixed dimension.
-  // We migrated `embedding` as VECTOR (any dim) so the schema file can ship
-  // before dims are known; here we promote it to VECTOR(N) once we have N
-  // and add the HNSW index. Existing rows are preserved through a USING cast.
+  const vs = await pool.query("SELECT 1 FROM pg_extension WHERE extname = 'vectorscale'");
+  const useDiskann = (vs.rowCount ?? 0) > 0;
+
+  if (!useDiskann && dims > 2000) {
+    // HNSW can't index this dim and DiskANN isn't installed; leave it unindexed
+    // (recall falls back to exact scan). Install pgvectorscale to enable it.
+    return false;
+  }
+
+  // Both methods need a fixed-dimension column. We ship `embedding` as VECTOR
+  // (any dim) so the schema file can land before dims are known; here we
+  // promote it to VECTOR(N) and build the index. Existing rows survive the cast.
+  const method = useDiskann ? "diskann" : "hnsw";
+  const indexName = useDiskann ? "chunks_diskann" : "chunks_hnsw";
   await pool.query(`
     ALTER TABLE semantic.chunks
       ALTER COLUMN embedding TYPE VECTOR(${dims}) USING embedding::VECTOR(${dims});
-    CREATE INDEX IF NOT EXISTS chunks_hnsw
-      ON semantic.chunks USING hnsw (embedding vector_cosine_ops);
+    CREATE INDEX IF NOT EXISTS ${indexName}
+      ON semantic.chunks USING ${method} (embedding vector_cosine_ops);
   `);
   return true;
 }

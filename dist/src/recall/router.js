@@ -95,6 +95,8 @@ function inferConceptTagsFromQuery(query) {
 }
 const DEFAULT_K = 12;
 const T2_PER_ROUTE_K = 6;
+/** Score multiplier for chunks whose fact was superseded by a later chunk. */
+const SUPERSEDED_PENALTY = 0.2;
 const STRUCTURED_ROUTES = [
     "anchor",
     "entity_ref",
@@ -201,6 +203,7 @@ export async function recall(deps, input) {
             llmTokensUsed: 0,
             score,
             latencyMs: Date.now() - start,
+            returnedChunkIds: t0Hits.map((c) => c.chunkId),
         });
         return {
             results: t0Hits,
@@ -229,6 +232,7 @@ export async function recall(deps, input) {
             llmTokensUsed: 0,
             score,
             latencyMs: Date.now() - start,
+            returnedChunkIds: filtered.map((c) => c.chunkId),
         });
         return {
             results: filtered,
@@ -358,6 +362,20 @@ export async function recall(deps, input) {
             all.push(c);
         }
     }
+    // Down-weight chunks whose underlying fact was superseded by a later chunk
+    // (P1#3). They stay recallable — for audit / "what did I used to think" — but
+    // lose to the current truth. One batched lookup on superseded_by.
+    if (all.length > 0) {
+        const sup = await deps.pool.query(`SELECT id FROM semantic.chunks WHERE id = ANY($1::uuid[]) AND superseded_by IS NOT NULL`, [all.map((c) => c.chunkId)]);
+        if (sup.rowCount && sup.rowCount > 0) {
+            const supSet = new Set(sup.rows.map((r) => r.id));
+            for (const c of all) {
+                if (supSet.has(c.chunkId)) {
+                    c.combinedScore *= SUPERSEDED_PENALTY;
+                }
+            }
+        }
+    }
     const reranked = mmrRerank(all, k);
     let filtered = reranked.filter((c) => c.combinedScore >= minScore);
     // Three-tier privacy filter: drop any chunk that's not visible to the
@@ -397,6 +415,7 @@ export async function recall(deps, input) {
         llmTokensUsed: 0,
         score,
         latencyMs: Date.now() - start,
+        returnedChunkIds: filtered.map((c) => c.chunkId),
     });
     return {
         results: filtered,
@@ -418,8 +437,8 @@ async function auditRecall(deps, input, partial) {
         .query(`INSERT INTO audit.recall_decisions
         (id, query_text, hit_tier, candidates, returned,
          agent_session_id, agent_id, llm_tokens_used, embed_calls, latency_ms,
-         score, scored_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())`, [
+         score, returned_chunk_ids, scored_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::uuid[], now())`, [
         id,
         input.query,
         partial.hitTier,
@@ -431,6 +450,7 @@ async function auditRecall(deps, input, partial) {
         partial.embedCalls,
         partial.latencyMs,
         partial.score,
+        partial.returnedChunkIds,
     ])
         .catch(() => {
         /* audit-write failures intentionally swallowed */

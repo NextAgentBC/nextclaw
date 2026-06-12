@@ -92,6 +92,7 @@ async function handleDashboardCommand(api, ctxObj) {
     return true;
 }
 import { startTranscriptWatcherDaemon } from "./src/workers/transcript-watcher.js";
+import { buildResidualExtractor } from "./src/ingest/residual.js";
 import { startShadowComparator } from "./src/workers/shadow-comparator.js";
 import { evaluateGuards, runDailyAnalyzer } from "./src/workers/tuning.js";
 import { ingestCompactionSummary } from "./src/workers/compaction-ingest.js";
@@ -464,6 +465,7 @@ export default definePluginEntry({
                             cfg,
                             pool,
                             embedding,
+                            llmResidual: buildResidualExtractor(cfg),
                             watcher,
                             logger: { info: (m) => api.logger.info(m), warn: (m) => api.logger.warn(m) },
                         });

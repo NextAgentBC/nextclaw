@@ -4,12 +4,13 @@
 #   docker compose up -d
 #   # PG ready at postgres://nextclaw:nextclaw@127.0.0.1:55432/nextclaw
 #
-# Image: pgvector/pgvector pins both Postgres and pgvector versions.
+# Image: nextclaw-pg:pg16-vectorscale = pgvector/pgvector:pg16 + pgvectorscale
+# (DiskANN, for >2000-dim embeddings). Build recipe: dev/vectorscale.Dockerfile.
 # The init.d/ script installs pg_trgm + btree_gin alongside pgvector.
 
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: nextclaw-pg:pg16-vectorscale
     container_name: nextclaw-pg
     restart: unless-stopped
     environment:
