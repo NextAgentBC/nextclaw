@@ -109,7 +109,6 @@ const DEFAULT_KIND = "fact";
 // of deep extraction. Tunable; promote to config if the residual gets wired.
 const RESIDUAL_CONFIDENCE_THRESHOLD = 0.7;
 const RESIDUAL_MAX_CHARS = 4000;
-const RESIDUAL_DAILY_TOKEN_BUDGET = 50_000;
 
 /* ------------------------- concept_tag derivation ------------------------- */
 /**
@@ -326,7 +325,7 @@ export async function ingestOne(deps: IngestDeps, input: IngestInput): Promise<I
   const weak = detConf < RESIDUAL_CONFIDENCE_THRESHOLD && sideConf < RESIDUAL_CONFIDENCE_THRESHOLD;
   if (weak && deps.llmResidual && text.length <= RESIDUAL_MAX_CHARS) {
     const spentToday = await residualTokensSpentToday(deps.pool).catch(() => 0);
-    if (spentToday < RESIDUAL_DAILY_TOKEN_BUDGET) {
+    if (spentToday < deps.cfg.residual.dailyTokenBudget) {
       const r = await deps.llmResidual(text, input.signals ?? {});
       llmTokensUsed += r.tokensUsed;
       extractor = mergeExtractorResults(r.result, extractor);

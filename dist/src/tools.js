@@ -9,6 +9,7 @@ import { resolveConfig, validateConfig } from "./config.js";
 import { buildEmbeddingClientFromConfig } from "./embedding/client.js";
 import { forgetChunk, getChunk, updateChunk } from "./edit/operations.js";
 import { ingestOne } from "./ingest/pipeline.js";
+import { buildResidualExtractor } from "./ingest/residual.js";
 import { recall } from "./recall/router.js";
 import { recordCitationFollowup } from "./recall/relevance.js";
 import { getActiveCommitmentsByChunk } from "./structured/commitments.js";
@@ -437,7 +438,7 @@ export function buildStoreTool(args) {
         async execute(_toolCallId, params) {
             const p = params;
             const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
-            const outcome = await ingestOne({ cfg, pool, embedding }, {
+            const outcome = await ingestOne({ cfg, pool, embedding, llmResidual: buildResidualExtractor(cfg) }, {
                 text: p.text,
                 source: "manual",
                 kind: "fact",

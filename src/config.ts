@@ -149,6 +149,7 @@ export type MemoryPostgresConfig = {
    * and pointing `model` at an OpenAI-compat or native-Gemini endpoint.
    */
   reflection?: ReflectionConfig;
+  residual?: ResidualConfig;
   /**
    * Moderator service (Phase C). When enabled, hooks openclaw's
    * Telegram `message_received` event and runs an orchestrator-worker
@@ -196,6 +197,19 @@ export type ReflectionConfig = {
   maxInputChars?: number;
   /** LLM endpoint. Two supported formats — see below. */
   model: ReflectionModelConfig;
+};
+
+/** Stage 4 LLM residual extractor (deep extraction for the regex long tail). */
+export type ResidualConfig = {
+  /** Master switch. Default false (deterministic-only ingest). */
+  enabled?: boolean;
+  /** Requests/minute cap — the broker rotates keys, this stops a burst (e.g.
+   *  transcript replay) from spamming a free-tier model. Default 8. */
+  maxRpm?: number;
+  /** Daily residual token budget; deep extraction pauses for the day past it. Default 50000. */
+  dailyTokenBudget?: number;
+  /** LLM endpoint (reuses the reflection model shape). Defaults to credbroker gemini-2.5-flash. */
+  model?: ReflectionModelConfig;
 };
 
 export type ReflectionModelConfig = {
@@ -335,6 +349,7 @@ export type ResolvedMemoryPostgresConfig = {
   transcriptWatchers: ResolvedTranscriptWatcher[];
   shadowComparators: ResolvedShadowComparator[];
   reflection: ResolvedReflectionConfig;
+  residual: ResolvedResidualConfig;
   moderator: ResolvedModeratorConfig;
 };
 
@@ -357,6 +372,18 @@ export type ResolvedReflectionConfig = {
   intervalMs: number;
   lookbackHours: number;
   maxInputChars: number;
+  model: {
+    format: "openai" | "gemini";
+    baseUrl: string;
+    model: string;
+    apiKeyEnv?: string;
+  };
+};
+
+export type ResolvedResidualConfig = {
+  enabled: boolean;
+  maxRpm: number;
+  dailyTokenBudget: number;
   model: {
     format: "openai" | "gemini";
     baseUrl: string;
@@ -495,6 +522,7 @@ export function resolveConfig(raw: MemoryPostgresConfig): ResolvedMemoryPostgres
     transcriptWatchers: (raw.transcriptWatchers ?? []).map(resolveTranscriptWatcher),
     shadowComparators: (raw.shadowComparators ?? []).map(resolveShadowComparator),
     reflection: resolveReflectionConfig(raw.reflection, credbroker),
+    residual: resolveResidualConfig(raw.residual, credbroker),
     moderator: resolveModeratorConfig(raw.moderator, credbroker),
   };
 }
@@ -564,6 +592,28 @@ function resolveModeratorConfig(
       apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
     },
     publishSkillsDir,
+  };
+}
+
+function resolveResidualConfig(
+  raw: ResidualConfig | undefined,
+  credbroker: ResolvedCredbrokerConfig,
+): ResolvedResidualConfig {
+  const block = raw ?? ({} as ResidualConfig);
+  const modelBlock = block.model ?? ({} as ReflectionModelConfig);
+  // Default to gemini (the credbroker only proxies gemini); honour an explicit openai.
+  const format = modelBlock.format === "openai" ? "openai" : "gemini";
+  const credbrokerFallback = format === "gemini" ? credbroker.geminiUrl : null;
+  return {
+    enabled: bool(block.enabled, false),
+    maxRpm: Math.max(1, num(block.maxRpm, 8)),
+    dailyTokenBudget: Math.max(0, num(block.dailyTokenBudget, 50_000)),
+    model: {
+      format,
+      baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : (credbrokerFallback ?? ""),
+      model: isString(modelBlock.model) ? modelBlock.model : "gemini-2.5-flash",
+      apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
+    },
   };
 }
 

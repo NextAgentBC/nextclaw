@@ -12,6 +12,7 @@ import { resolveConfig, validateConfig } from "./config.js";
 import { buildEmbeddingClientFromConfig } from "./embedding/client.js";
 import { forgetChunk, getChunk, updateChunk } from "./edit/operations.js";
 import { ingestOne } from "./ingest/pipeline.js";
+import { buildResidualExtractor } from "./ingest/residual.js";
 import { recall } from "./recall/router.js";
 import { recordCitationFollowup } from "./recall/relevance.js";
 import { getActiveCommitmentsByChunk } from "./structured/commitments.js";
@@ -522,7 +523,7 @@ export function buildStoreTool(args: { config: OpenClawConfig; sessionKey?: stri
       const p = params as StoreParams;
       const { cfg, pool, embedding } = await setup(pluginConfigOf(args.config));
       const outcome = await ingestOne(
-        { cfg, pool, embedding },
+        { cfg, pool, embedding, llmResidual: buildResidualExtractor(cfg) },
         {
           text: p.text,
           source: "manual",

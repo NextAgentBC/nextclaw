@@ -97,6 +97,7 @@ export function resolveConfig(raw) {
         transcriptWatchers: (raw.transcriptWatchers ?? []).map(resolveTranscriptWatcher),
         shadowComparators: (raw.shadowComparators ?? []).map(resolveShadowComparator),
         reflection: resolveReflectionConfig(raw.reflection, credbroker),
+        residual: resolveResidualConfig(raw.residual, credbroker),
         moderator: resolveModeratorConfig(raw.moderator, credbroker),
     };
 }
@@ -161,6 +162,24 @@ function resolveModeratorConfig(raw, credbroker) {
             apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
         },
         publishSkillsDir,
+    };
+}
+function resolveResidualConfig(raw, credbroker) {
+    const block = raw ?? {};
+    const modelBlock = block.model ?? {};
+    // Default to gemini (the credbroker only proxies gemini); honour an explicit openai.
+    const format = modelBlock.format === "openai" ? "openai" : "gemini";
+    const credbrokerFallback = format === "gemini" ? credbroker.geminiUrl : null;
+    return {
+        enabled: bool(block.enabled, false),
+        maxRpm: Math.max(1, num(block.maxRpm, 8)),
+        dailyTokenBudget: Math.max(0, num(block.dailyTokenBudget, 50_000)),
+        model: {
+            format,
+            baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : (credbrokerFallback ?? ""),
+            model: isString(modelBlock.model) ? modelBlock.model : "gemini-2.5-flash",
+            apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
+        },
     };
 }
 function resolveReflectionConfig(raw, credbroker) {
