@@ -95,6 +95,8 @@ function inferConceptTagsFromQuery(query) {
 }
 const DEFAULT_K = 12;
 const T2_PER_ROUTE_K = 6;
+/** Score multiplier for chunks whose fact was superseded by a later chunk. */
+const SUPERSEDED_PENALTY = 0.2;
 const STRUCTURED_ROUTES = [
     "anchor",
     "entity_ref",
@@ -356,6 +358,20 @@ export async function recall(deps, input) {
         }
         else {
             all.push(c);
+        }
+    }
+    // Down-weight chunks whose underlying fact was superseded by a later chunk
+    // (P1#3). They stay recallable — for audit / "what did I used to think" — but
+    // lose to the current truth. One batched lookup on superseded_by.
+    if (all.length > 0) {
+        const sup = await deps.pool.query(`SELECT id FROM semantic.chunks WHERE id = ANY($1::uuid[]) AND superseded_by IS NOT NULL`, [all.map((c) => c.chunkId)]);
+        if (sup.rowCount && sup.rowCount > 0) {
+            const supSet = new Set(sup.rows.map((r) => r.id));
+            for (const c of all) {
+                if (supSet.has(c.chunkId)) {
+                    c.combinedScore *= SUPERSEDED_PENALTY;
+                }
+            }
         }
     }
     const reranked = mmrRerank(all, k);

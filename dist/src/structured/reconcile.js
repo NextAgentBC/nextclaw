@@ -72,7 +72,7 @@ export async function reconcile(pool, input) {
             out.eventIds.push(id);
         }
         for (const p of input.result.preferences) {
-            const { id, deduped } = await upsertPreference(client, p);
+            const { id, deduped } = await upsertPreference(client, p, input.chunkId);
             if (deduped) {
                 out.dedupCount += 1;
             }
@@ -189,7 +189,7 @@ async function upsertEvent(client, ev, actorId, targetId) {
     return { id, deduped: false };
 }
 /* ------------------------------- preferences ------------------------------- */
-async function upsertPreference(client, p) {
+async function upsertPreference(client, p, chunkId) {
     const existing = await client.query(`SELECT id, value, evidence_count FROM structured.preferences
        WHERE scope = $1 AND key = $2 AND invalidated_at IS NULL
        LIMIT 1`, [p.scope, p.key]);
@@ -203,6 +203,14 @@ async function upsertPreference(client, p) {
         }
         // Supersede: invalidate old, write new linked.
         await client.query("UPDATE structured.preferences SET invalidated_at = now() WHERE id = $1", [row.id]);
+        // Mark the old preference's source chunk(s) as superseded by this chunk so
+        // recall down-weights the now-outdated fact (P1#3). Provenance links the
+        // old preference id → its originating chunk.
+        await client.query(`UPDATE semantic.chunks SET superseded_by = $1
+         WHERE id IN (SELECT chunk_id FROM structured.provenance
+                        WHERE item_kind = 'preference' AND item_id = $2 AND chunk_id IS NOT NULL)
+           AND id <> $1
+           AND superseded_by IS NULL`, [chunkId, row.id]);
         const id = randomUUID();
         await client.query(`INSERT INTO structured.preferences
          (id, scope, key, value, rule_text, evidence_count, confidence, supersedes)

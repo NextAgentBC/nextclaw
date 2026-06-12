@@ -103,7 +103,7 @@ export async function reconcile(pool: Pool, input: ReconcileInput): Promise<Reco
     }
 
     for (const p of input.result.preferences) {
-      const { id, deduped } = await upsertPreference(client, p);
+      const { id, deduped } = await upsertPreference(client, p, input.chunkId);
       if (deduped) {out.dedupCount += 1;}
       out.preferenceIds.push(id);
     }
@@ -257,6 +257,7 @@ async function upsertEvent(
 async function upsertPreference(
   client: PoolClient,
   p: PreferenceCandidate,
+  chunkId: string,
 ): Promise<{ id: string; deduped: boolean }> {
   const existing = await client.query<{ id: string; value: unknown; evidence_count: number }>(
     `SELECT id, value, evidence_count FROM structured.preferences
@@ -279,6 +280,17 @@ async function upsertPreference(
     await client.query(
       "UPDATE structured.preferences SET invalidated_at = now() WHERE id = $1",
       [row.id],
+    );
+    // Mark the old preference's source chunk(s) as superseded by this chunk so
+    // recall down-weights the now-outdated fact (P1#3). Provenance links the
+    // old preference id → its originating chunk.
+    await client.query(
+      `UPDATE semantic.chunks SET superseded_by = $1
+         WHERE id IN (SELECT chunk_id FROM structured.provenance
+                        WHERE item_kind = 'preference' AND item_id = $2 AND chunk_id IS NOT NULL)
+           AND id <> $1
+           AND superseded_by IS NULL`,
+      [chunkId, row.id],
     );
     const id = randomUUID();
     await client.query(
