@@ -318,6 +318,7 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
       llmTokensUsed: 0,
       score,
       latencyMs: Date.now() - start,
+      returnedChunkIds: t0Hits.map((c) => c.chunkId),
     });
     return {
       results: t0Hits,
@@ -350,6 +351,7 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
       llmTokensUsed: 0,
       score,
       latencyMs: Date.now() - start,
+      returnedChunkIds: filtered.map((c) => c.chunkId),
     });
     return {
       results: filtered,
@@ -573,6 +575,7 @@ export async function recall(deps: RecallDeps, input: RecallInput): Promise<Reca
     llmTokensUsed: 0,
     score,
     latencyMs: Date.now() - start,
+    returnedChunkIds: filtered.map((c) => c.chunkId),
   });
 
   return {
@@ -602,6 +605,7 @@ async function auditRecall(
     llmTokensUsed: number;
     score: number;
     latencyMs: number;
+    returnedChunkIds: string[];
   },
 ): Promise<void> {
   const id = randomUUID();
@@ -610,8 +614,8 @@ async function auditRecall(
       `INSERT INTO audit.recall_decisions
         (id, query_text, hit_tier, candidates, returned,
          agent_session_id, agent_id, llm_tokens_used, embed_calls, latency_ms,
-         score, scored_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())`,
+         score, returned_chunk_ids, scored_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::uuid[], now())`,
       [
         id,
         input.query,
@@ -624,6 +628,7 @@ async function auditRecall(
         partial.embedCalls,
         partial.latencyMs,
         partial.score,
+        partial.returnedChunkIds,
       ],
     )
     .catch(() => {
