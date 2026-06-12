@@ -103,6 +103,14 @@ export type IngestOutcome = {
 
 const DEFAULT_KIND = "fact";
 
+/* ----------------------------- residual gating ---------------------------- */
+// Stage 4 LLM residual fires when deterministic extraction is weak by COMBINED
+// CONFIDENCE (this subsumes the old empty-only gate). Two guards bound the cost
+// of deep extraction. Tunable; promote to config if the residual gets wired.
+const RESIDUAL_CONFIDENCE_THRESHOLD = 0.7;
+const RESIDUAL_MAX_CHARS = 4000;
+const RESIDUAL_DAILY_TOKEN_BUDGET = 50_000;
+
 /* ------------------------- concept_tag derivation ------------------------- */
 /**
  * Stage 0 deterministic concept_tag derivation. No LLM, no embeddings.
@@ -158,6 +166,32 @@ function deriveConceptTags(text: string): string[] {
 }
 
 export const _conceptTagInternal = { deriveConceptTags };
+
+/** Average confidence across all extracted candidates; 0 when nothing fired. */
+function combinedConfidence(r: ExtractorResult): number {
+  const confs = [
+    ...r.entities.map((e) => e.confidence),
+    ...r.events.map((e) => e.confidence),
+    ...r.preferences.map((p) => p.confidence),
+    ...r.metrics.map((m) => m.confidence),
+    ...r.relations.map((x) => x.confidence),
+  ];
+  if (confs.length === 0) {return 0;}
+  return confs.reduce((a, b) => a + b, 0) / confs.length;
+}
+
+export const _residualInternal = { combinedConfidence };
+
+/** Residual LLM tokens already spent today (UTC day) — the daily-budget guard. */
+async function residualTokensSpentToday(pool: Pool): Promise<number> {
+  const r = await pool.query<{ sum: string | null }>(
+    `SELECT coalesce(sum(llm_tokens_used), 0)::text AS sum
+       FROM audit.ingest_decisions
+      WHERE ingest_path = 'llm_residual'
+        AND scored_at >= date_trunc('day', now())`,
+  );
+  return Number(r.rows[0]?.sum ?? 0);
+}
 
 /* ----------------------------- multi-key idx ------------------------------ */
 
@@ -280,21 +314,24 @@ export async function ingestOne(deps: IngestDeps, input: IngestInput): Promise<I
     }
   }
 
-  // ---------- Stage 4 LLM residual (only when both stages produced little) ----
-  const detWeak = det.metrics.length === 0
-    && det.events.length === 0
-    && det.preferences.length === 0
-    && det.relations.length === 0;
-  const sideWeak = !sidecar?.ok
-    || (sidecar.result.metrics.length === 0
-        && sidecar.result.events.length === 0
-        && sidecar.result.preferences.length === 0
-        && sidecar.result.relations.length === 0);
-  if (detWeak && sideWeak && deps.llmResidual) {
-    const r = await deps.llmResidual(text, input.signals ?? {});
-    llmTokensUsed += r.tokensUsed;
-    extractor = mergeExtractorResults(r.result, extractor);
-    path = "llm_residual";
+  // ---------- Stage 4 LLM residual ----------
+  // Fire on LOW CONFIDENCE, not just emptiness: a chunk where the regex
+  // extractors caught only a little, weakly, is exactly where the long tail
+  // (coreference, implicit preferences, cross-turn facts) hides. Two guards
+  // keep deep extraction from running away on cost — a per-chunk char cap and
+  // a daily token budget. (Inert until a residual model is bound to
+  // deps.llmResidual; the gate is ready for when it is.)
+  const detConf = combinedConfidence(det);
+  const sideConf = sidecar?.ok ? combinedConfidence(sidecar.result) : 0;
+  const weak = detConf < RESIDUAL_CONFIDENCE_THRESHOLD && sideConf < RESIDUAL_CONFIDENCE_THRESHOLD;
+  if (weak && deps.llmResidual && text.length <= RESIDUAL_MAX_CHARS) {
+    const spentToday = await residualTokensSpentToday(deps.pool).catch(() => 0);
+    if (spentToday < RESIDUAL_DAILY_TOKEN_BUDGET) {
+      const r = await deps.llmResidual(text, input.signals ?? {});
+      llmTokensUsed += r.tokensUsed;
+      extractor = mergeExtractorResults(r.result, extractor);
+      path = "llm_residual";
+    }
   }
 
   // ---------- Stage 3 cache + write semantic.chunks ----------
