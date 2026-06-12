@@ -23,6 +23,7 @@ import type { Pool } from "pg";
 import pgvector from "pgvector/pg";
 import type { ResolvedMemoryPostgresConfig } from "../config.js";
 import type { EmbeddingClient } from "../embedding/client.js";
+import { invalidateChunk } from "./invalidate.js";
 
 export type EditDeps = {
   cfg: ResolvedMemoryPostgresConfig;
@@ -109,15 +110,9 @@ export async function updateChunk(
     )
     .catch(() => { /* audit-write failures must not break the edit */ });
 
-  // Invalidate cache.recall entries that might have surfaced this chunk
-  // with stale text. Cheap broad invalidation; cache.recall is UNLOGGED.
-  await deps.pool
-    .query(`UPDATE cache.recall SET invalidated = true WHERE invalidated = false`)
-    .catch(() => undefined);
-  // Drop hot_chunks for this chunk so T1 doesn't keep the old warmth.
-  await deps.pool
-    .query(`DELETE FROM cache.hot_chunks WHERE chunk_id = $1`, [params.chunkId])
-    .catch(() => undefined);
+  // Invalidate every cache tier (T0 working sets, hot_chunks, recall, QA) that
+  // might still serve the now-stale text.
+  await invalidateChunk(deps.pool, params.chunkId, "edit_update");
 
   return { ok: true, chunkId: params.chunkId, reEmbedded };
 }
@@ -158,8 +153,6 @@ export async function forgetChunk(
     ]);
     await deps.pool.query(`DELETE FROM semantic.chunk_indexes WHERE chunk_id = $1`, [params.chunkId])
       .catch(() => undefined);
-    await deps.pool.query(`DELETE FROM cache.hot_chunks WHERE chunk_id = $1`, [params.chunkId])
-      .catch(() => undefined);
   } else {
     await deps.pool.query(
       `UPDATE semantic.chunks
@@ -168,13 +161,9 @@ export async function forgetChunk(
         WHERE id = $1 AND agent_id = $2`,
       [params.chunkId, params.agentId],
     );
-    await deps.pool.query(`DELETE FROM cache.hot_chunks WHERE chunk_id = $1`, [params.chunkId])
-      .catch(() => undefined);
   }
-  // Bust cache.recall broadly — cheap, UNLOGGED.
-  await deps.pool
-    .query(`UPDATE cache.recall SET invalidated = true WHERE invalidated = false`)
-    .catch(() => undefined);
+  // Invalidate every cache tier (T0 working sets, hot_chunks, recall, QA).
+  await invalidateChunk(deps.pool, params.chunkId, mode === "tombstone" ? "forget_tombstone" : "forget_trash");
 
   await deps.pool
     .query(

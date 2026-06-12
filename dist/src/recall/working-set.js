@@ -145,6 +145,17 @@ export function clearAllWorkingSets() {
     REGISTRY.clear();
 }
 /**
+ * Evict a chunk from every live working set. Called on memory edit/forget so a
+ * curated-away or rewritten chunk can't keep surfacing from any session's T0.
+ * (`WorkingSet.evict` existed but had no caller — stale T0 entries used to age
+ * out only by LRU until this fan-out was wired.)
+ */
+export function evictFromAllWorkingSets(chunkId) {
+    for (const ws of REGISTRY.values()) {
+        ws.evict(chunkId);
+    }
+}
+/**
  * Profile chunks (`kind='profile'`) are the "core memory" pattern borrowed
  * from MemGPT/Letta: per-agent (and optionally per-entity) summaries that
  * stay resident in T0 across every recall, instead of being one of many
