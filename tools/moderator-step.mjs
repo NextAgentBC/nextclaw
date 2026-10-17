@@ -27,7 +27,7 @@
  *       [--moderator-key-env OPENAI_API_KEY]
  *
  * For Gemini-via-credbroker (no key):
- *   --moderator-format gemini  --moderator-base http://100.79.97.110:8800/v1/proxy/gemini  --moderator-model gemini-2.5-flash
+ *   --moderator-format gemini  --moderator-base http://100.79.97.110:8800/v1/proxy/gemini  --moderator-model gemini-flash
  */
 
 import pg from "pg";

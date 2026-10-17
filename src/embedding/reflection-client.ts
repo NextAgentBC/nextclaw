@@ -19,7 +19,7 @@ export type ReflectionClientConfig = {
   /** API base. For openai: e.g. https://api.openai.com. For gemini-via-broker:
    *  http://100.79.97.110:8800/v1/proxy/gemini . The chat path is built per-format. */
   baseUrl: string;
-  /** Model id. e.g. `gpt-4o-mini` / `gemini-2.5-flash` / `qwen3-chat:7b`. */
+  /** Model id. e.g. `gpt-4o-mini` / `gemini-flash` / `qwen3-chat:7b`. */
   model: string;
   format: ReflectionApiFormat;
   apiKey?: string;

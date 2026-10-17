@@ -95,7 +95,7 @@ const DEFAULT_ROLE: RoleSpec = {
     "口吻、要不要列点都看问题本身决定，不用套格式。",
   tools: ["memory_search", "web_search"],
   memoryScope: {},
-  model: "gemini:gemini-2.5-flash",
+  model: "gemini:gemini-flash",
 };
 
 /* --------------------------- role auto-register --------------------------- */

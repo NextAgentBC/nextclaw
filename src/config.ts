@@ -208,7 +208,7 @@ export type ResidualConfig = {
   maxRpm?: number;
   /** Daily residual token budget; deep extraction pauses for the day past it. Default 50000. */
   dailyTokenBudget?: number;
-  /** LLM endpoint (reuses the reflection model shape). Defaults to credbroker gemini-2.5-flash. */
+  /** LLM endpoint (reuses the reflection model shape). Defaults to credbroker gemini-flash. */
   model?: ReflectionModelConfig;
 };
 
@@ -220,7 +220,7 @@ export type ReflectionModelConfig = {
   /** Base URL (no path). For credbroker gemini, e.g.
    *  http://100.79.97.110:8800/v1/proxy/gemini . */
   baseUrl: string;
-  /** Model id. e.g. `gpt-4o-mini`, `gemini-2.5-flash`. */
+  /** Model id. e.g. `gpt-4o-mini`, `gemini-flash`. */
   model: string;
   /** Optional env var holding a bearer token / api key. Skip for credbroker
    *  setups that authenticate via Tailscale identity. */
@@ -588,7 +588,7 @@ function resolveModeratorConfig(
       format,
       baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : (credbrokerFallback ?? ""),
       model: isString(modelBlock.model) ? modelBlock.model
-        : format === "gemini" ? "gemini-2.5-flash" : "gpt-5.5",
+        : format === "gemini" ? "gemini-flash" : "gpt-5.5",
       apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
     },
     publishSkillsDir,
@@ -611,7 +611,7 @@ function resolveResidualConfig(
     model: {
       format,
       baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : (credbrokerFallback ?? ""),
-      model: isString(modelBlock.model) ? modelBlock.model : "gemini-2.5-flash",
+      model: isString(modelBlock.model) ? modelBlock.model : "gemini-flash",
       apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
     },
   };
@@ -636,7 +636,7 @@ function resolveReflectionConfig(
       format,
       baseUrl: isString(modelBlock.baseUrl) ? modelBlock.baseUrl : (credbrokerFallback ?? ""),
       model: isString(modelBlock.model) ? modelBlock.model
-        : format === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini",
+        : format === "gemini" ? "gemini-flash" : "gpt-4o-mini",
       apiKeyEnv: isString(modelBlock.apiKeyEnv) ? modelBlock.apiKeyEnv : undefined,
     },
   };

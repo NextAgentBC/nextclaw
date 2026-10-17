@@ -146,7 +146,7 @@ async function scenarioE_workerRoundtrip() {
   const workerLlm = buildWorkerLlmFromConfig({
     format: "gemini",
     baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
-    model: "gemini-2.5-flash",
+    model: "gemini-flash",
   });
   const cfg = {
     pluginId: "memory-postgres",
@@ -247,7 +247,7 @@ async function scenarioG_workerTools() {
   const workerLlm = buildWorkerLlmFromConfig({
     format: "gemini",
     baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
-    model: "gemini-2.5-flash",
+    model: "gemini-flash",
   });
   const cfg = {
     pluginId: "memory-postgres",
@@ -310,7 +310,7 @@ async function scenarioH_webSearch() {
   const workerLlm = buildWorkerLlmFromConfig({
     format: "gemini",
     baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
-    model: "gemini-2.5-flash",
+    model: "gemini-flash",
   });
   const cfg = {
     pluginId: "memory-postgres",
@@ -370,13 +370,13 @@ async function scenarioI_skillEmit() {
   const workerLlm = buildWorkerLlmFromConfig({
     format: "gemini",
     baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
-    model: "gemini-2.5-flash",
+    model: "gemini-flash",
   });
   const cfg = {
     pluginId: "memory-postgres",
     storage: { schema: "public", chunksTable: "chunks", chunkIndexesTable: "chunk_indexes" },
     embedding: { model: "qwen3-embedding:0.6b" },
-    moderator: { model: { format: "gemini", model: "gemini-2.5-flash" } },
+    moderator: { model: { format: "gemini", model: "gemini-flash" } },
   };
   const logger = { info: (m) => console.log("    log:", m), warn: () => {} };
   const wkDeps = { pool, workerLlm, embedding, cfg, agentId: AGENT, logger, publishSkillsDir: tmpRoot };
@@ -467,12 +467,12 @@ async function scenarioJ_entityReflection() {
     model: {
       format: "gemini",
       baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini",
-      model: "gemini-2.5-flash",
+      model: "gemini-flash",
     },
   });
   const cfg = {
     enabled: true, intervalMs: 86400000, lookbackHours: 24 * 30, maxInputChars: 8000,
-    model: { format: "gemini", baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini", model: "gemini-2.5-flash" },
+    model: { format: "gemini", baseUrl: "http://100.79.97.110:8800/v1/proxy/gemini", model: "gemini-flash" },
   };
   const outcomes = await runEntityReflectionForAgent(
     { pool, embedding, llm, cfg },
